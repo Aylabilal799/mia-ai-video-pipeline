@@ -26,6 +26,18 @@ from models.task import (
 
 logger = logging.getLogger(__name__)
 
+
+def _lipsync_enabled() -> bool:
+    """Lip-sync (Wav2Lip) is OFF by default. Current pipeline direction is
+    voiceover narration + AI-generated lifestyle visuals + karaoke captions,
+    not forced mouth-sync -- this was a deliberate product decision (Wav2Lip
+    was failing/OOMing on CPU and its payoff for Shorts retention is
+    unproven). Set AGNES_ENABLE_LIPSYNC=1 in the environment to re-enable
+    later if analytics show it's actually needed.
+    """
+    return os.environ.get("AGNES_ENABLE_LIPSYNC", "0").strip() == "1"
+
+
 _SENTENCE_END_RE = re.compile(r"(?<=[。！？])|(?<=[.!?])\s+")
 
 _CHARS_PER_SEC_BY_SCRIPT = {
@@ -217,13 +229,13 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 _PROGRESS_SCENE_PROMPTS_START + _PROGRESS_SCENE_PROMPTS_SPAN * (i / max(total, 1)),
             )
 
-            # Alternate between two shot types instead of banning talking-head
-            # shots outright: roughly every other scene (and always at least
-            # one scene) is a direct-to-camera speaking shot with her face and
-            # mouth clearly visible, so the narration reads as HER telling the
-            # story rather than an unrelated voiceover over pure B-roll. The
-            # remaining scenes stay B-roll/action shots for visual variety.
-            is_talking_scene = (i % 2 == 1) or (total == 1)
+            # Talking-to-camera shots are only generated when lip-sync is
+            # actually enabled. With lip-sync off (the current default),
+            # generating a close-up "talking directly to camera" shot with
+            # no real mouth-sync just draws attention to the mismatch, so
+            # every scene uses natural lifestyle/B-roll framing instead
+            # (spec section 12: avoid fake talking shots without lipsync).
+            is_talking_scene = _lipsync_enabled() and ((i % 2 == 1) or (total == 1))
 
             if is_talking_scene:
                 prompt_instructions = (
@@ -522,7 +534,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         # Lip-sync the talking-shot scenes using the SAME word_cues timestamps
         # captions were just built from (requirement: one timing source for
         # both). Runs after scene videos + full narration audio both exist.
-        if word_cues:
+        if word_cues and _lipsync_enabled():
             await self._apply_lipsync_to_talking_scenes(word_cues)
 
     async def _apply_lipsync_to_talking_scenes(self, word_cues: list) -> None:
@@ -556,7 +568,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         total = len(paragraphs)
         lipsync_count = 0
         for i, para in enumerate(paragraphs):
-            is_talking_scene = (i % 2 == 1) or (total == 1)
+            is_talking_scene = _lipsync_enabled() and ((i % 2 == 1) or (total == 1))
             n_words = len(para.text.split())
             para_cues = word_cues[cue_idx: cue_idx + n_words]
             cue_idx += n_words
