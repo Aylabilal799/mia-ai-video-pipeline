@@ -33,6 +33,11 @@ def font_dir() -> str:
 # 默认中文字体文件名（需位于 resource/fonts/ 下）
 DEFAULT_CHINESE_FONT = "STHeitiMedium.ttc"
 
+# 默认粗体字幕字体文件名 -- 目前 resource/fonts/ 下唯一实际存在的字体文件。
+# 用作任何无法解析为真实文件的字体"名称"（如 "Montserrat ExtraBold"，项目里
+# 并未随附该字体文件）的最终兜底，见 resolve_font_path() 中的说明。
+DEFAULT_BOLD_CAPTION_FONT = "ArchivoBlack-Regular.ttf"
+
 # ═══════════════════════════════════════════════════
 # 字幕安全边距 / 最大宽度（供 web/helpers.py::_build_position 与两条字幕
 # 渲染路径 — karaoke.py / concat.py::_parse_srt_to_clips — 共同使用，
@@ -68,7 +73,23 @@ def resolve_font_path(font: str) -> str:
     1. 绝对路径且文件存在 → 直接返回
     2. 文件名（含扩展名）→ 在 resource/fonts/ 目录下查找
     3. 已知的非 CJK 字体名 → 回退到 DEFAULT_CHINESE_FONT（兼容旧任务）
-    4. 其他系统字体名 → 直接返回
+    4. 其他任意字体"名称"（如 "Montserrat ExtraBold"，非文件名/非已知别名）→
+       回退到 DEFAULT_BOLD_CAPTION_FONT.
+       NOTE (caption-size bug fix): previously this fell through to
+       `return font`, i.e. the raw font *name* string (e.g.
+       "Montserrat ExtraBold") was handed to PIL/moviepy as if it were a
+       file path. PIL's ImageFont.truetype() cannot resolve a bare font
+       *name* on a headless Linux box with no fontconfig font of that
+       name installed -- it raises OSError. karaoke.py's build_karaoke_clips
+       swallows that exception and silently falls back to
+       ImageFont.load_default(), a tiny fixed-size (~10px) bitmap font that
+       completely ignores the configured `fontsize` (46 / 60-75px). That is
+       the root cause of captions rendering as "tiny YouTube subtitles"
+       regardless of MIA_CAPTION_FONT_SIZE. Since only ONE font file ships
+       in resource/fonts/ (ArchivoBlack-Regular.ttf -- a heavy black-weight
+       display face well suited to CapCut/TikTok-style captions), any font
+       *name* we can't resolve to a real file on disk now explicitly maps
+       to that bundled file instead of being passed through unresolved.
     """
     # 已经是绝对路径，直接返回
     if os.path.isabs(font) and os.path.exists(font):
@@ -79,6 +100,9 @@ def resolve_font_path(font: str) -> str:
         candidate = os.path.join(font_dir(), font)
         if os.path.exists(candidate):
             return candidate
+        # Has an extension but isn't one of our bundled files -- still a
+        # "name", not a resolvable path; fall through to the bold-caption
+        # fallback below rather than returning a dead path.
 
     # 检查是否为已知的非 CJK 字体（向后兼容：旧任务的 font 可能仍为 "Arial"）
     if font.strip().lower() in _NON_CJK_FONTS:
@@ -90,7 +114,21 @@ def resolve_font_path(font: str) -> str:
             )
             return fallback
 
-    # 当作系统字体名称返回
+    # 任意其他 unresolved 字体"名称"（非绝对路径、非项目内已知文件名）→
+    # 回退到项目内置的粗体字幕字体文件，保证 PIL/moviepy 一定能加载到
+    # 一个真实存在、尺寸可控的字体文件，而不是把裸名称当路径传下去。
+    bold_fallback = os.path.join(font_dir(), DEFAULT_BOLD_CAPTION_FONT)
+    if os.path.exists(bold_fallback):
+        logger.warning(
+            f"Font '{font}' is not a resolvable file/known alias -- "
+            f"falling back to bundled caption font {DEFAULT_BOLD_CAPTION_FONT} "
+            f"(previously this returned the unresolved name, which PIL/"
+            f"moviepy cannot load, silently shrinking captions to the tiny "
+            f"PIL default font)."
+        )
+        return bold_fallback
+
+    # 内置字体也缺失（不应发生）：当作系统字体名称返回，保留旧行为兜底。
     return font
 
 

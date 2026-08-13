@@ -369,23 +369,129 @@ def _forced_align_word_cues(audio_path: str, text: str) -> List[_Cue]:
     model = _get_whisper_align_model(WhisperModel)
     segments, _info = model.transcribe(audio_path, word_timestamps=True, language="en")
 
-    cues: List[_Cue] = []
+    whisper_words: List[dict] = []
     for seg in segments:
         for w in (seg.words or []):
             word_text = (w.word or "").strip()
             if not word_text:
                 continue
-            cues.append(_Cue(
-                start=timedelta(seconds=float(w.start)),
-                end=timedelta(seconds=float(w.end)),
-                content=word_text,
-            ))
+            whisper_words.append({
+                "text": word_text,
+                "start": float(w.start),
+                "end": float(w.end),
+            })
 
-    if not cues:
+    if not whisper_words:
         raise RuntimeError(
             "Local forced alignment (faster-whisper) produced no word "
             "timestamps for the generated Kokoro audio."
         )
+
+    # IMPORTANT (script-accuracy bug fix): do NOT use Whisper's own
+    # transcription text as the caption content. Whisper is re-recognizing
+    # the TTS'd audio from scratch and can mishear words (e.g. "in" ->
+    # "it"), which then shows up as a caption that silently deviates from
+    # the user's exact supplied script even though the audio itself said
+    # the right thing. Whisper is only trustworthy here for *timing* --
+    # the displayed word text must come from the original script. Realign
+    # the original script's own word tokens onto Whisper's timestamps.
+    cues = _realign_original_words_to_whisper_timing(text, whisper_words)
+    return cues
+
+
+def _realign_original_words_to_whisper_timing(
+    original_text: str, whisper_words: List[dict],
+) -> List["_Cue"]:
+    """Keeps the exact original script wording, borrowing only the timing
+    from Whisper's forced-alignment transcription.
+
+    Whisper's word *count* almost always matches the script 1:1 (same
+    audio, same speech), so the common case is a straight zip. When counts
+    differ slightly (Whisper splitting/merging a token, e.g. contractions),
+    falls back to a sequence alignment (difflib) so original words with no
+    confident Whisper match still get a reasonable interpolated timestamp
+    instead of being dropped -- captions must cover the whole script.
+    """
+    import difflib
+    import re as _re_local
+
+    original_words = original_text.split()
+    if not original_words:
+        return []
+
+    if len(original_words) == len(whisper_words):
+        return [
+            _Cue(
+                start=timedelta(seconds=whisper_words[i]["start"]),
+                end=timedelta(seconds=whisper_words[i]["end"]),
+                content=original_words[i],
+            )
+            for i in range(len(original_words))
+        ]
+
+    logger.info(
+        f"[TTS] Forced-alignment word count mismatch (script={len(original_words)} "
+        f"vs whisper={len(whisper_words)}) -- realigning via sequence matching "
+        f"instead of a straight zip."
+    )
+
+    def _norm(w: str) -> str:
+        return _re_local.sub(r"[^a-z0-9]", "", w.lower())
+
+    orig_norm = [_norm(w) for w in original_words]
+    whisper_norm = [_norm(w["text"]) for w in whisper_words]
+
+    matcher = difflib.SequenceMatcher(a=orig_norm, b=whisper_norm, autojunk=False)
+    cues: List[_Cue] = []
+    last_end = whisper_words[0]["start"] if whisper_words else 0.0
+
+    for tag, a0, a1, b0, b1 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(a1 - a0):
+                w = whisper_words[b0 + k]
+                cues.append(_Cue(
+                    start=timedelta(seconds=w["start"]),
+                    end=timedelta(seconds=w["end"]),
+                    content=original_words[a0 + k],
+                ))
+                last_end = w["end"]
+        elif tag == "replace" and (a1 - a0) == (b1 - b0):
+            # Same count on both sides, just different tokens (e.g. Whisper
+            # normalized a contraction differently) -- pair them up 1:1 and
+            # keep the ORIGINAL script's word text.
+            for k in range(a1 - a0):
+                w = whisper_words[b0 + k]
+                cues.append(_Cue(
+                    start=timedelta(seconds=w["start"]),
+                    end=timedelta(seconds=w["end"]),
+                    content=original_words[a0 + k],
+                ))
+                last_end = w["end"]
+        else:
+            # Original has words Whisper doesn't (insert) or Whisper has
+            # extra words not in the script (delete) or a lopsided replace.
+            # For any *original* words in this span, interpolate their
+            # timing evenly across the corresponding Whisper span (or a
+            # short span after the last known timestamp if Whisper has
+            # nothing here at all) rather than dropping them from the
+            # captions.
+            span_start = whisper_words[b0]["start"] if b0 < len(whisper_words) else last_end
+            span_end = whisper_words[b1 - 1]["end"] if b1 - 1 < len(whisper_words) and b1 > b0 else span_start + 0.3 * max(a1 - a0, 1)
+            n = a1 - a0
+            if n > 0:
+                step = max((span_end - span_start) / n, 0.05)
+                for k in range(n):
+                    ws = span_start + step * k
+                    we = span_start + step * (k + 1)
+                    cues.append(_Cue(
+                        start=timedelta(seconds=ws),
+                        end=timedelta(seconds=we),
+                        content=original_words[a0 + k],
+                    ))
+                    last_end = we
+
+    # Guard against any ordering hiccups from interpolated spans.
+    cues.sort(key=lambda c: c.start)
     return cues
 
 
