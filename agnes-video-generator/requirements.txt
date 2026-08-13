@@ -1,0 +1,26 @@
+fastapi>=0.100.0,<1.0.0
+uvicorn>=0.23.0,<1.0.0
+websockets>=12.0,<14.0
+requests>=2.28.0,<3.0.0
+pydantic>=2.0.0,<3.0.0
+PyYAML>=6.0,<7.0
+moviepy>=2.0.0,<3.0.0
+tenacity>=8.0.0,<10.0.0
+python-multipart>=0.0.6,<1.0.0
+
+# v2.0 新增
+srt>=3.5.0,<4.0.0               # SRT 字幕解析/生成工具
+
+# Kokoro TTS（本地/离线，唯一 TTS 引擎 —— Edge-TTS 已彻底移除）
+kokoro>=0.9.4,<1.0.0
+soundfile>=0.12.1,<1.0.0
+misaki[en]>=0.9.4,<1.0.0        # Kokoro 的英语 G2P（af_heart 等 af_/am_/bf_/bm_ 音色需要）
+# 系统依赖（不是 pip 包，需要另外安装）：
+#   apt-get install -y espeak-ng   # misaki 在遇到词典外单词时的 G2P 兜底
+# 可选：Kokoro 未返回 token 级时间戳时，本地强制对齐兜底路径需要：
+faster-whisper>=1.0.0,<2.0.0
+
+# 静态 ffmpeg 二进制，替代系统 ffmpeg。
+# 显式声明后，npm 包（bin/cli.js）与 Docker 均能在无宿主机 ffmpeg 时一键拿到二进制，
+# 用户无需另行安装系统级 ffmpeg。此前仅靠 moviepy 的传递依赖隐式引入，存在断裂风险。
+imageio-ffmpeg>=0.2.0,<1.0.0
