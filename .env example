@@ -1,0 +1,32 @@
+DISCORD_TOKEN=
+
+
+AGNES_API_KEYS=key1,key2,key3
+
+# Redis URL (local)
+REDIS_URL=redis://localhost:6379/0
+
+AGNES_HOST=127.0.0.1
+AGNES_PORT=8765
+
+# --- Temp file-sharing server (avoids Discord's upload size limit) ---
+FILE_SHARE_DIR=/root/deepseekyt/shared_videos
+FILE_SHARE_PORT=8766
+FILE_SHARE_BASE_URL=http:0.0.0.0:8766/files
+FILE_SHARE_MAX_AGE_HOURS=24
+
+# --- Must match the two above, since tasks.py reads THESE, not the FILE_SHARE_* ones ---
+PUBLIC_SHARE_DIR=/root/deepseekyt/shared_videos
+PUBLIC_BASE_URL=0.0.0.0:8766/files
+
+OPENROUTER_API_KEY=
+# Model to use for scene-writing. Sonnet (default below) gives the best
+# quality; swap to anthropic/claude-haiku-4.5 for a much cheaper/faster
+# option if quality is already good enough. Check openrouter.ai/models for
+# the current exact model IDs, since these get renamed over time.
+OPENROUTER_MODEL=google/gemma-4-31b-it:free
+
+MIA_VOICE=af_heart
+
+GEMINI_API_KEY=key1,key2,key3
+GEMINI_MODEL=gemini-3.6-flash
