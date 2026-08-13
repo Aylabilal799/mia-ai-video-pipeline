@@ -30,3 +30,5 @@ MIA_VOICE=af_heart
 
 GEMINI_API_KEY=key1,key2,key3
 GEMINI_MODEL=gemini-3.6-flash
+FREELLMAPI_BASE_URL=http://localhost:3001/v1
+FREELLMAPI_API_KEY=freellmapi-your-unified-key
