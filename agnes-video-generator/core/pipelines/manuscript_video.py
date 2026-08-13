@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import re
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from core.api.agnes_video import AgnesVideoAPI
 from core.api.agnes_image import AgnesImageAPI
@@ -56,6 +56,11 @@ def _chars_per_sec(text: str) -> float:
 
 
 # Greedy-merge segment duration thresholds adjusted to yield ~6-7 scenes for a 45-60s vlog
+# NOTE: these chars-per-second thresholds are ONLY used to decide where to
+# split the manuscript into paragraphs (text segmentation) and as a last-
+# resort fallback if TTS timing is unavailable. Once real TTS word cues
+# exist (the normal case, see FIX #2 below), actual scene *duration* is
+# always taken from those cues, never from this estimate.
 _MAX_SEGMENT_DURATION = 8.5
 _MIN_SEGMENT_DURATION = 4.5
 
@@ -71,6 +76,22 @@ _PROGRESS_WAIT_SPAN = 0.25
 _PROGRESS_AUDIO_START = 0.60
 _PROGRESS_SUBTITLE_START = 0.75
 _PROGRESS_CONCAT_START = 0.80
+
+# FIX #1 -- identity lock. Layered on top of whatever the screenwriter wrote
+# for a scene, and only when a reference image is actually being sent with
+# the request (never rely on prompt text alone -- the real reference image
+# is still what's supplied to every scene generation call).
+_IDENTITY_LOCK_PREFIX = (
+    "[IDENTITY -- do not change] The woman in this scene is the exact same "
+    "woman from the provided reference image: same face, same hair, same "
+    "identity, same body appearance, same outfit. Do not alter her "
+    "identity in any way.\n\n"
+)
+
+# FIX #2 -- assembly-time tolerance. Scene clips within this many seconds of
+# their target narration span are left untouched (re-encoding a
+# near-perfect match just burns time and quality for no benefit).
+_DURATION_CONFORM_TOLERANCE_SECONDS = 0.35
 
 
 class ManuscriptVideoPipeline(MultiScenePipeline):
@@ -92,8 +113,142 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         self.screenwriter = Screenwriter(api_key=api_key, model=chat_model)
         self.image_generator = AgnesImageAPI(api_key=api_key, model=image_model)
 
+        # FIX #2 state: {paragraph_index: (scene_start_sec, scene_end_sec)}
+        # derived from real TTS word cues in _build_scenes, and the cached
+        # sub_maker so _generate_audio doesn't have to regenerate narration
+        # that was already produced up-front.
+        self._scene_time_spans: Dict[int, Tuple[float, float]] = {}
+        self._narration_sub_maker = None
+
     def _get_watermark_language_text(self) -> str:
         return self._state.manuscript_text
+
+    # ------------------------------------------------------------------
+    # FIX #2: TTS-first master timeline
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cue_seconds(v) -> float:
+        return v.total_seconds() if hasattr(v, "total_seconds") else float(v)
+
+    def _derive_scene_spans_from_cues(
+        self, paragraphs: List[ManuscriptParagraph], word_cues: list,
+    ) -> Dict[int, Tuple[float, float]]:
+        """Maps the flat, whole-script word_cues (in paragraph order) back
+        to each paragraph by cumulative word count -- the same technique
+        already used for lip-sync -- then sets each paragraph's scene span
+        to [own first-word start, next paragraph's first-word start), with
+        the final paragraph's span running to the last cue's end.
+
+        Using the NEXT paragraph's start (rather than this paragraph's own
+        last-word end) as the boundary means scenes tile the narration with
+        zero gaps, including any natural pause between sentences -- so the
+        concatenated video timeline matches the narration timeline exactly,
+        which is the actual requirement (not just "each scene's own words
+        are covered").
+        """
+        cue_idx = 0
+        per_para: List[Tuple[int, Optional[float], Optional[float]]] = []
+        for para in paragraphs:
+            n_words = len(para.text.split()) if para.text else 0
+            para_cues = word_cues[cue_idx: cue_idx + n_words]
+            cue_idx += n_words
+            if para_cues:
+                start = self._cue_seconds(para_cues[0].start)
+                end = self._cue_seconds(para_cues[-1].end)
+            else:
+                start = end = None
+            per_para.append((para.index, start, end))
+
+        last_end = self._cue_seconds(word_cues[-1].end) if word_cues else None
+
+        spans: Dict[int, Tuple[float, float]] = {}
+        for i, (idx, start, end) in enumerate(per_para):
+            if start is None:
+                continue
+            next_start = None
+            if i + 1 < len(per_para):
+                next_start = per_para[i + 1][1]
+            span_end = next_start if next_start is not None else (last_end if last_end is not None else end)
+            span_end = max(span_end, start + 0.5)
+            spans[idx] = (start, span_end)
+        return spans
+
+    async def _ensure_scene_spans_from_tts(self) -> Dict[int, Tuple[float, float]]:
+        """FIX #2 core step. Generates (or, on resume, recovers) the full
+        narration audio and its real word/token timestamps BEFORE any scene
+        video is submitted, then derives every paragraph's exact
+        scene_start/scene_end from those timestamps -- not from
+        len(text) / chars_per_second.
+
+        Idempotent by design: if `full_narration.mp3` already exists (a
+        prior run, or a resumed task), this recovers cues from it instead
+        of regenerating, using the same `_recover_sub_maker` path
+        `_generate_audio` already relied on -- so `_generate_audio` later
+        in the pipeline just reuses what's cached here instead of doing a
+        second TTS pass.
+
+        Returns {} (never raises) if audio is disabled or there's no text
+        to narrate -- callers fall back to the old chars-per-second
+        estimate only in that case.
+        """
+        paragraphs = self._state.paragraphs
+        if not paragraphs or not self._state.audio_config.enabled:
+            return {}
+
+        full_text = "\n\n".join(p.text for p in paragraphs if p.text)
+        if not full_text:
+            return {}
+
+        audio_path = os.path.join(self.working_dir, "full_narration.mp3")
+        try:
+            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                sub_maker = await self._recover_sub_maker(
+                    full_text, self._state.audio_config, self._state.subtitle_config,
+                )
+            else:
+                await self._emit(
+                    "audio", "running",
+                    f"Generating narration ({len(full_text)} chars)...",
+                    _PROGRESS_AUDIO_START,
+                )
+                sub_maker = await self._generate_audio_with_fallback(
+                    output_path=audio_path,
+                    text=full_text,
+                    audio_config=self._state.audio_config,
+                    subtitle_config=self._state.subtitle_config,
+                    duration_sec=0.0,
+                    empty_placeholder="",
+                )
+        except Exception:
+            logger.exception(
+                "[Manuscript] Up-front TTS generation failed -- scene timing "
+                "will fall back to chars-per-second estimate for this run"
+            )
+            return {}
+
+        self._state.combined_audio = audio_path
+        self.task_manager.update_state(combined_audio=audio_path)
+        self._narration_sub_maker = sub_maker
+
+        word_cues = getattr(sub_maker, "cues", None) if sub_maker else None
+        if not word_cues:
+            logger.warning(
+                "[Manuscript] TTS produced no word cues -- scene timing will "
+                "fall back to chars-per-second estimate for this run"
+            )
+            return {}
+
+        return self._derive_scene_spans_from_cues(paragraphs, word_cues)
+
+    def _scene_duration_seconds(self, para: ManuscriptParagraph, spans: Dict[int, Tuple[float, float]]) -> int:
+        span = spans.get(para.index)
+        if span:
+            return max(int(round(span[1] - span[0])), 2)
+        # Fallback ONLY when real TTS timing wasn't available this run.
+        return max(int(math.ceil(len(para.text) / _chars_per_sec(para.text))), 3)
+
+    # ------------------------------------------------------------------
 
     async def _build_scenes(self) -> None:
         if not self._state.paragraphs:
@@ -105,12 +260,16 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
 
         await self._generate_scene_prompts(self._state.paragraphs)
 
+        # FIX #2: real narration timing, computed BEFORE scene videos are
+        # submitted, is the single source of truth for scene duration.
+        self._scene_time_spans = await self._ensure_scene_spans_from_tts()
+
         self._state.scenes = [
             SceneTask(
                 index=p.index,
                 scene_prompt=p.scene_prompt,
                 narration_text=p.text,
-                duration=max(int(math.ceil(len(p.text) / _chars_per_sec(p.text))), 3),
+                duration=self._scene_duration_seconds(p, self._scene_time_spans),
             )
             for p in self._state.paragraphs
         ]
@@ -126,38 +285,32 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         return []
 
     async def _get_scene_reference_images(self, para: ManuscriptParagraph, para_dir: str) -> List[str]:
-        anchor_refs = self._get_identity_reference_paths()
-        if not anchor_refs:
-            return []
-        anchor = anchor_refs[0]
+        """FIX #1: every scene uses ONLY the single canonical MIA anchor
+        image as its identity reference (image-to-video, one reference),
+        instead of ALSO generating a fresh per-scene "identity keyframe"
+        image.
 
-        keyframe_path = os.path.join(para_dir, "identity_keyframe.png")
-        if os.path.exists(keyframe_path):
-            return [anchor, keyframe_path]
+        The old path sent Agnes [anchor, freshly-generated keyframe], which
+        put Agnes into keyframes mode. Because each keyframe was itself
+        generated independently, scene by scene, THAT keyframe was free to
+        drift the face/hair/identity -- which is what produced different-
+        looking women between scenes, even though the anchor itself never
+        changed. Passing the anchor alone keeps one, unmodified, reused
+        identity source across every scene (image-to-video / "ti2vid" mode
+        in AgnesVideoAPI.submit_video when exactly one reference is given).
+        """
+        return self._get_identity_reference_paths()
 
-        keep_identity = (
-            "[PRESERVE -- keep exactly] Same person as the reference image: "
-            "same face, same hair, same body type, same identity. Do NOT alter identity.\n\n"
-            "[CHANGE -- mini-vlog scene action] " + (para.scene_prompt or "")
-        )
-        os.makedirs(para_dir, exist_ok=True)
-        for attempt in range(3):
-            self._check_shutdown()
-            try:
-                img_output = await self.image_generator.generate_single_image(
-                    prompt=keep_identity,
-                    reference_image_paths=[anchor],
-                    size=f"{self._state.video_width}x{self._state.video_height}",
-                )
-                img_output.save(keyframe_path)
-                return [anchor, keyframe_path]
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep((attempt + 1) * 15)
-                else:
-                    logger.error(f"[MIA] i2i keyframe failed for scene {para.index}: {e}")
-
-        return [anchor]
+    def _identity_locked_prompt(self, scene_prompt: str, has_reference_image: bool) -> str:
+        """Do not rely on prompt text alone for identity -- the real
+        reference image is still what's supplied via
+        `_get_scene_reference_images`. This just makes the accompanying
+        text explicit and forbids identity drift, per Agnes's own
+        recommendation for i2v/keyframe prompts.
+        """
+        if not has_reference_image:
+            return scene_prompt
+        return _IDENTITY_LOCK_PREFIX + (scene_prompt or "")
 
     def _split_text(self, text: str) -> List[ManuscriptParagraph]:
         text = self.fix_double_utf8(text)
@@ -252,7 +405,9 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     "- Natural, animated speaking expression and subtle head/hand gestures while "
                     "she talks -- not a static, frozen pose, and not an exaggerated grin held for "
                     "the whole shot.\n"
-                    "- Handheld selfie-vlog camera style, slight natural handheld motion."
+                    "- Handheld selfie-vlog camera style, slight natural handheld motion.\n"
+                    "- She is the exact same woman shown in the provided reference image -- do not "
+                    "change her face, hair, identity, body appearance, or outfit."
                 )
             else:
                 prompt_instructions = (
@@ -291,7 +446,9 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     "background people freezing mid-motion, looping the same movement, teleporting "
                     "position, sliding instead of stepping, or walking through the main character. "
                     "Background presence should stay secondary to Mia -- she remains the visual "
-                    "focus of the shot."
+                    "focus of the shot.\n"
+                    "- She is the exact same woman shown in the provided reference image -- do not "
+                    "change her face, hair, identity, body appearance, or outfit."
                 )
 
             prompt = await asyncio.to_thread(
@@ -313,6 +470,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         _SUBMIT_RETRIES = 3
         _WAIT_RETRIES = 3
         paragraphs = self._state.paragraphs
+        scene_by_index = {s.index: s for s in self._state.scenes}
         total = len(paragraphs)
         pending: list[tuple[int, str, str]] = []
 
@@ -341,13 +499,20 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 _PROGRESS_SUBMIT_START + _PROGRESS_SUBMIT_SPAN * (i / max(total, 1)),
             )
 
-            para_duration = max(int(math.ceil(len(para.text) / _chars_per_sec(para.text))), 3)
+            # FIX #2: duration comes from the scene plan, which was set in
+            # _build_scenes from real TTS word-cue spans (falls back to the
+            # chars-per-second estimate only if TTS timing wasn't available).
+            scene = scene_by_index.get(para.index)
+            para_duration = scene.duration if scene else self._scene_duration_seconds(para, self._scene_time_spans)
+
+            # FIX #1: single canonical anchor reference only.
             scene_refs = await self._get_scene_reference_images(para, para_dir)
+            scene_prompt = self._identity_locked_prompt(para.scene_prompt, bool(scene_refs))
 
             for retry in range(_SUBMIT_RETRIES):
                 try:
                     video_id = await self.video_api.submit_video(
-                        prompt=para.scene_prompt,
+                        prompt=scene_prompt,
                         reference_image_paths=scene_refs,
                         duration=para_duration,
                         width=self._state.video_width,
@@ -396,6 +561,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
     async def _validate_and_regenerate_scene(
         self, para: ManuscriptParagraph, para_dir: str, video_path: str,
     ) -> None:
+        scene_by_index = {s.index: s for s in self._state.scenes}
         for attempt in range(self._SCENE_VALIDATION_MAX_RETRIES + 1):
             ok, reason = await self._check_scene_video(video_path, para.scene_prompt)
             if ok:
@@ -411,12 +577,16 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 if os.path.exists(stale):
                     os.remove(stale)
 
+            # FIX #1: still just the single canonical anchor on regeneration.
             scene_refs = await self._get_scene_reference_images(para, para_dir)
+            scene_prompt = self._identity_locked_prompt(para.scene_prompt, bool(scene_refs))
+            scene = scene_by_index.get(para.index)
+            para_duration = scene.duration if scene else self._scene_duration_seconds(para, self._scene_time_spans)
             try:
                 video_id = await self.video_api.submit_video(
-                    prompt=para.scene_prompt,
+                    prompt=scene_prompt,
                     reference_image_paths=scene_refs,
-                    duration=max(int(math.ceil(len(para.text) / _chars_per_sec(para.text))), 3),
+                    duration=para_duration,
                     width=self._state.video_width,
                     height=self._state.video_height,
                     seed=self._state.character_seed,
@@ -497,6 +667,15 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             return None
 
     async def _generate_audio(self) -> object:
+        # FIX #2: narration audio (and its word cues) was already generated
+        # up-front in _build_scenes -> _ensure_scene_spans_from_tts, since
+        # real TTS timing must exist BEFORE scene videos and captions are
+        # built. This just returns the cached result instead of generating
+        # a second time. The defensive branches below only fire if that
+        # up-front step was skipped or failed for some reason.
+        if self._narration_sub_maker is not None and self._state.combined_audio:
+            return self._narration_sub_maker
+
         paragraphs = self._state.paragraphs
         audio_config = self._state.audio_config
         full_text = "\n\n".join(p.text for p in paragraphs if p.text)
@@ -506,9 +685,11 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         audio_path = os.path.join(self.working_dir, "full_narration.mp3")
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
             self._state.combined_audio = audio_path
-            return await self._recover_sub_maker(
+            sub_maker = await self._recover_sub_maker(
                 full_text, self._state.audio_config, self._state.subtitle_config,
             )
+            self._narration_sub_maker = sub_maker
+            return sub_maker
 
         await self._emit("audio", "running", f"Generating narration ({len(full_text)} chars)...", _PROGRESS_AUDIO_START)
         sub_maker = await self._generate_audio_with_fallback(
@@ -522,6 +703,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
 
         self._state.combined_audio = audio_path
         self.task_manager.update_state(combined_audio=audio_path)
+        self._narration_sub_maker = sub_maker
         return sub_maker
 
     async def _generate_subtitles(self, sub_maker: object = None) -> None:
@@ -531,7 +713,17 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         if not segment_texts:
             return
 
-        segment_durations = [max(len(p.text) / _chars_per_sec(p.text), 2.0) for p in paragraphs]
+        # FIX #2: caption segment durations now come from the SAME cue-
+        # derived spans scene videos were timed against, not a separate
+        # chars-per-second estimate -- one timing source, as required.
+        # (The word-level karaoke highlighting below already used
+        # sub_maker.cues directly and is unaffected either way.)
+        segment_durations = [
+            (self._scene_time_spans[p.index][1] - self._scene_time_spans[p.index][0])
+            if self._scene_time_spans.get(p.index)
+            else max(len(p.text) / _chars_per_sec(p.text), 2.0)
+            for p in paragraphs if p.text
+        ]
         await self._emit("subtitle", "running", "Generating captions...", _PROGRESS_SUBTITLE_START)
 
         srt_path, styles_path = await self.generate_subtitles_common(
@@ -662,6 +854,76 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         # accurate lip-sync coverage instead of implying it always worked.
         self.task_manager.update_state(lipsync_scenes_synced=lipsync_count, lipsync_scenes_total=total)
 
+    async def _conform_scene_to_span(self, para: ManuscriptParagraph, target_duration: float) -> None:
+        """FIX #2 (assembly step). The video model only produces clips
+        close to a requested duration, not frame-exact, and per-scene
+        rounding error accumulates across a whole manuscript. Before
+        concatenation, trim or freeze-extend each scene clip so its length
+        matches the exact narration span for that paragraph:
+          - actual > target -> trim to target_duration.
+          - actual < target -> freeze (clone) the last frame to fill the gap,
+            so the NEXT scene never starts early relative to the narration.
+        Clips already within tolerance are left untouched. On any ffmpeg
+        failure this logs a warning and keeps the original clip rather than
+        breaking the run.
+        """
+        video_path = para.video_file
+        if not video_path or not os.path.exists(video_path) or target_duration <= 0:
+            return
+
+        actual = await self._probe_duration(video_path)
+        if actual is None:
+            return
+        diff = actual - target_duration
+        if abs(diff) <= _DURATION_CONFORM_TOLERANCE_SECONDS:
+            return
+
+        base, ext = os.path.splitext(video_path)
+        conformed_path = f"{base}_conformed{ext or '.mp4'}"
+
+        try:
+            if diff > 0:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", video_path, "-t", f"{target_duration:.3f}",
+                    "-c", "copy", conformed_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=30)
+                if proc.returncode != 0 or not os.path.exists(conformed_path):
+                    # Stream copy can miss the target if it doesn't land on a
+                    # keyframe -- fall back to a re-encoded trim.
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", video_path, "-t", f"{target_duration:.3f}",
+                        conformed_path,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=60)
+            else:
+                pad_seconds = target_duration - actual
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vf", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
+                    "-t", f"{target_duration:.3f}",
+                    conformed_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=60)
+
+            if os.path.exists(conformed_path) and os.path.getsize(conformed_path) > 10_000:
+                para.video_file = conformed_path
+            else:
+                logger.warning(
+                    "[Manuscript] Scene %d: duration conform produced no usable output "
+                    "(actual=%.2fs target=%.2fs), keeping original clip",
+                    para.index, actual, target_duration,
+                )
+        except Exception:
+            logger.exception(
+                "[Manuscript] Scene %d: duration conform errored "
+                "(actual=%.2fs target=%.2fs), keeping original clip",
+                para.index, actual, target_duration,
+            )
+
     async def _composite_final(self) -> str:
         paragraphs = self._state.paragraphs
         subtitle_config = self._state.subtitle_config
@@ -669,6 +931,16 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
 
         if os.path.exists(output_path):
             return output_path
+
+        # FIX #2: conform every scene clip to its exact narration span
+        # before concatenation, so the assembled video's timeline matches
+        # the narration timeline rather than drifting from accumulated
+        # per-scene generation error.
+        for para in paragraphs:
+            self._check_shutdown()
+            span = self._scene_time_spans.get(para.index)
+            if span:
+                await self._conform_scene_to_span(para, span[1] - span[0])
 
         video_paths = [p.video_file for p in paragraphs if p.video_file and os.path.exists(p.video_file)]
         if not video_paths:
