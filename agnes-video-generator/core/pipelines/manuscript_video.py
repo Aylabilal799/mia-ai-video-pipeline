@@ -81,11 +81,21 @@ _PROGRESS_CONCAT_START = 0.80
 # for a scene, and only when a reference image is actually being sent with
 # the request (never rely on prompt text alone -- the real reference image
 # is still what's supplied to every scene generation call).
+#
+# NOTE: this locks FACIAL / CHARACTER identity only (face, facial
+# structure, eyes/nose/lips, hair identity & hairstyle, apparent age,
+# overall character identity). Clothing/outfit is intentionally NOT locked
+# here -- wardrobe is allowed to vary scene-to-scene so Mia can be dressed
+# appropriately for whatever each scene is depicting. A clothing change
+# between scenes is expected behavior, not an identity failure.
 _IDENTITY_LOCK_PREFIX = (
     "[IDENTITY -- do not change] The woman in this scene is the exact same "
-    "woman from the provided reference image: same face, same hair, same "
-    "identity, same body appearance, same outfit. Do not alter her "
-    "identity in any way.\n\n"
+    "woman from the provided reference image: same face, same facial "
+    "structure, same eyes/nose/lips, same hair identity and hairstyle, same "
+    "apparent age, same overall character identity. Do not alter her "
+    "identity in any way. Her clothing/outfit MAY change naturally between "
+    "scenes to suit the scene -- wardrobe variation is expected and is not "
+    "an identity change.\n\n"
 )
 
 # FIX #2 -- assembly-time tolerance. Scene clips within this many seconds of
@@ -307,6 +317,10 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         `_get_scene_reference_images`. This just makes the accompanying
         text explicit and forbids identity drift, per Agnes's own
         recommendation for i2v/keyframe prompts.
+
+        This locks FACE / CHARACTER identity only. It deliberately does not
+        constrain clothing/outfit -- wardrobe is allowed to vary between
+        scenes (see `_IDENTITY_LOCK_PREFIX`).
         """
         if not has_reference_image:
             return scene_prompt
@@ -407,7 +421,9 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     "the whole shot.\n"
                     "- Handheld selfie-vlog camera style, slight natural handheld motion.\n"
                     "- She is the exact same woman shown in the provided reference image -- do not "
-                    "change her face, hair, identity, body appearance, or outfit."
+                    "change her face, facial structure, eyes/nose/lips, hair identity/hairstyle, "
+                    "apparent age, or overall character identity. Her clothing/outfit MAY vary "
+                    "naturally between scenes -- wardrobe changes are allowed and expected."
                 )
             else:
                 prompt_instructions = (
@@ -448,7 +464,10 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     "Background presence should stay secondary to Mia -- she remains the visual "
                     "focus of the shot.\n"
                     "- She is the exact same woman shown in the provided reference image -- do not "
-                    "change her face, hair, identity, body appearance, or outfit."
+                    "change her face, facial structure, eyes/nose/lips, hair identity/hairstyle, "
+                    "apparent age, or overall character identity. Her clothing/outfit MAY vary "
+                    "naturally between scenes to suit the action -- wardrobe changes are allowed "
+                    "and expected, not an identity failure."
                 )
 
             prompt = await asyncio.to_thread(
