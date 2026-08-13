@@ -1,0 +1,5 @@
+.env
+wav2lip/
+*.pth
+shared_videos/
+agnes-video-generator/.working_dir/
