@@ -38,6 +38,15 @@ MIA_SEED = 42
 MIA_GENERATION_WIDTH = 768
 MIA_GENERATION_HEIGHT = 1344
 
+# Lip-sync (Wav2Lip) is intentionally OFF by default -- see decision doc.
+# It was unreliable on CPU (frequent OOM/failures, 3+ min/clip) and its
+# payoff for Shorts retention is unproven vs. voiceover + captions. The
+# actual gate lives in core/pipelines/manuscript_video.py::_lipsync_enabled(),
+# which reads the AGNES_ENABLE_LIPSYNC env var; this constant mirrors that
+# default here for discoverability. To re-enable: set AGNES_ENABLE_LIPSYNC=1
+# in the environment (not this file alone).
+ENABLE_LIPSYNC = os.getenv("AGNES_ENABLE_LIPSYNC", "0").strip() == "1"
+
 # TTS Configuration (AvaNeural for upbeat creator voice)
 MIA_VOICE = "af_heart"
 MIA_VOICE_RATE = "+5%"

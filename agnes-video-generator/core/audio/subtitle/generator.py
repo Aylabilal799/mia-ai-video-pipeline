@@ -296,9 +296,18 @@ class SubtitleSrtMixin:
             gap = gaps[i - 1]
             prospective_dur = e_s - group_start_s
             prospective_chars = group_chars + len(txt)
+            # Hard 1-4 word ceiling, same requirement as
+            # _group_items_for_karaoke_no_tail_merge below -- this grouping
+            # feeds the plain-SRT fallback path (cues_to_srt /
+            # _generate_fine_srt_from_word_cues), which is what actually
+            # renders whenever karaoke word-highlight rendering is
+            # unavailable/fails. Without this cap here too, that fallback
+            # could (and did) produce 5+ word captions like "I was honestly
+            # one of" even though the primary karaoke path enforces <=4.
             should_break = (
                 prospective_dur > max_duration
                 or prospective_chars > max_chars
+                or len(groups[-1]) >= 4
                 or (gap > 0.4 and group_chars > 4 and len(items) > 8)
             )
             if should_break:
@@ -309,7 +318,8 @@ class SubtitleSrtMixin:
                 groups[-1].append((s_s, e_s, txt))
                 group_chars += len(txt)
 
-        # 合并过短的尾部组（与 _group_items_to_srt 相同的启发式）
+        # 合并过短的尾部组（与 _group_items_to_srt 相同的启发式），但绝不
+        # 合并出超过 4 个词的组 -- 否则会重新制造出我们本要避免的 5+ 词字幕。
         while len(groups) >= 2:
             last_group = groups[-1]
             prev_group = groups[-2]
@@ -318,9 +328,11 @@ class SubtitleSrtMixin:
             prev_chars = sum(len(w[2]) for w in prev_group)
             merged_dur = last_group[-1][1] - prev_group[0][0]
             merged_chars = prev_chars + last_chars
+            merged_words = len(prev_group) + len(last_group)
             if (last_dur < 0.8
                     and merged_dur <= max_duration * 1.5
-                    and merged_chars <= max_chars * 1.6):
+                    and merged_chars <= max_chars * 1.6
+                    and merged_words <= 4):
                 groups[-2] = prev_group + last_group
                 groups.pop()
             else:

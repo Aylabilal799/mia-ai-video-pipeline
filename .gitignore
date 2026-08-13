@@ -3,3 +3,6 @@ wav2lip/
 *.pth
 shared_videos/
 agnes-video-generator/.working_dir/
+agnes-video-generator/server.log
+agnes-video-generator/server.pid
+__pycache__/
