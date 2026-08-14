@@ -42,6 +42,39 @@ class _Cue:
     content: str
 
 
+def _is_punctuation_only(text: str) -> bool:
+    """True if `text` has no alphanumeric characters (e.g. '.', ',', '-',
+    '...', '!?'). Misaki's G2P tokenizer can occasionally emit punctuation
+    as its own token separate from the adjacent word; if left alone those
+    become their own karaoke caption group (e.g. "talking about" / "."),
+    which is explicitly disallowed. See _merge_stray_punctuation_cues."""
+    return bool(text) and not any(ch.isalnum() for ch in text)
+
+
+def _merge_stray_punctuation_cues(cues: List["_Cue"]) -> List["_Cue"]:
+    """Folds any punctuation-only cue into the immediately preceding word
+    cue (appended to its text, its end timestamp extended to cover the
+    punctuation's span) so punctuation never renders as a standalone
+    caption group. A punctuation token with no preceding word (rare -- only
+    possible if the very first token is punctuation) is dropped rather than
+    kept as an orphan caption.
+    """
+    merged: List["_Cue"] = []
+    for cue in cues:
+        if _is_punctuation_only(cue.content):
+            if merged:
+                prev = merged[-1]
+                merged[-1] = _Cue(
+                    start=prev.start,
+                    end=max(prev.end, cue.end),
+                    content=prev.content + cue.content,
+                )
+            # else: leading stray punctuation with nothing to attach to -- drop it.
+            continue
+        merged.append(cue)
+    return merged
+
+
 @dataclass
 class _SubMakerLike:
     cues: List[_Cue] = field(default_factory=list)
@@ -214,6 +247,7 @@ class KokoroTTSEngine(TTSEngine):
                 except OSError:
                     pass
 
+        word_cues = _merge_stray_punctuation_cues(word_cues)
         used_native = bool(word_cues)
         if not word_cues:
             logger.warning(
@@ -222,6 +256,7 @@ class KokoroTTSEngine(TTSEngine):
                 "evenly-spaced timings."
             )
             word_cues = _forced_align_word_cues(output_path, text)
+            word_cues = _merge_stray_punctuation_cues(word_cues)
 
         sub_maker = _SubMakerLike(cues=word_cues)
         _log_cue_diagnostics(

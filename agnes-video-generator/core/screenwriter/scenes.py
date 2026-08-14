@@ -157,6 +157,31 @@ if GEMINI_KEYS:
     )
 
 
+# --- Optional FreeLLMAPI last-resort fallback --------------------------------
+# If FREELLMAPI_API_KEY is set, generate_scene_prompt_for_paragraph() tries
+# FreeLLMAPI (a self-hosted OpenAI-compatible router that aggregates many
+# providers' free tiers, including Gemini and OpenRouter) as a LAST resort,
+# only after Gemini and OpenRouter have both already failed. This exists
+# purely to survive the case where both of the above are simultaneously
+# rate-limited or erroring -- FreeLLMAPI's own internal fallback chain gives
+# the request many more providers to try before the whole paragraph fails.
+#
+# FREELLMAPI_BASE_URL defaults to a local instance on the same host
+# (http://localhost:3001). Only the chat completions path is needed here.
+# Model defaults to "auto" so FreeLLMAPI's router picks whatever's healthy.
+FREELLMAPI_KEYS = _load_key_pool("FREELLMAPI_API_KEY")
+FREELLMAPI_MODEL = os.environ.get("FREELLMAPI_MODEL", "auto")
+FREELLMAPI_BASE_URL = os.environ.get("FREELLMAPI_BASE_URL", "http://localhost:3001/v1")
+FREELLMAPI_URL = f"{FREELLMAPI_BASE_URL.rstrip('/')}/chat/completions"
+
+if FREELLMAPI_KEYS:
+    logger.info(
+        f"[Screenwriter] FreeLLMAPI ENABLED as last-resort fallback for scene-prompt "
+        f"generation: model={FREELLMAPI_MODEL}, url={FREELLMAPI_URL}, "
+        f"{len(FREELLMAPI_KEYS)} key(s) in pool"
+    )
+
+
 def _call_gemini(system_prompt: str, user_prompt: str, api_key: str) -> str:
     resp = requests.post(
         GEMINI_URL,
@@ -209,6 +234,32 @@ def _call_openrouter(system_prompt: str, user_prompt: str, api_key: str) -> str:
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]
+
+
+def _call_freellmapi(system_prompt: str, user_prompt: str, api_key: str) -> str:
+    resp = requests.post(
+        FREELLMAPI_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": FREELLMAPI_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.8,
+            "max_tokens": 2000,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = data["choices"][0]["message"]["content"]
+    if not content:
+        raise RuntimeError(f"FreeLLMAPI returned an empty response: {data}")
+    return content
 
 
 class ScreenwriterScenesMixin:
@@ -506,25 +557,40 @@ Output ONLY the visual prompt text, no JSON, no explanation.
                 )
                 logger.info(f"[Screenwriter] OpenRouter response received ({len(raw)} chars)")
             except Exception as e:
-                # If Gemini was never configured, OpenRouter was the
-                # explicitly chosen provider -- a failure here must surface
-                # as a real error rather than quietly degrading further.
-                logger.error(
-                    f"[Screenwriter] OpenRouter call FAILED (model={OPENROUTER_MODEL}): {e}"
+                logger.warning(
+                    f"[Screenwriter] OpenRouter call FAILED (model={OPENROUTER_MODEL}): {e}. "
+                    f"Falling back..."
                 )
-                if not GEMINI_KEYS:
-                    raise
+                raw = None
+
+        if raw is None and FREELLMAPI_KEYS:
+            logger.info(
+                f"[Screenwriter] Provider: FreeLLMAPI (model={FREELLMAPI_MODEL}, "
+                f"{len(FREELLMAPI_KEYS)} key(s))"
+            )
+            try:
+                raw = _call_with_key_rotation(
+                    _call_freellmapi, "FreeLLMAPI", FREELLMAPI_KEYS, system_prompt, user_prompt
+                )
+                logger.info(f"[Screenwriter] FreeLLMAPI response received ({len(raw)} chars)")
+            except Exception as e:
+                # FreeLLMAPI was the last configured provider in the chain --
+                # a failure here must surface as a real error rather than
+                # quietly degrading further.
+                logger.error(
+                    f"[Screenwriter] FreeLLMAPI call FAILED (model={FREELLMAPI_MODEL}): {e}"
+                )
                 raw = None
 
         if raw is None:
-            if GEMINI_KEYS or OPENROUTER_KEYS:
+            if GEMINI_KEYS or OPENROUTER_KEYS or FREELLMAPI_KEYS:
                 raise RuntimeError(
-                    "All configured LLM providers (Gemini/OpenRouter) failed "
-                    "to generate a scene prompt."
+                    "All configured LLM providers (Gemini/OpenRouter/FreeLLMAPI) "
+                    "failed to generate a scene prompt."
                 )
             logger.info(
                 "[Screenwriter] Provider: Agnes built-in LLM "
-                "(no GEMINI_API_KEY / OPENROUTER_API_KEY set)"
+                "(no GEMINI_API_KEY / OPENROUTER_API_KEY / FREELLMAPI_API_KEY set)"
             )
             raw = self._chat(system_prompt, user_prompt)
         prompt = strip_code_fence(raw)

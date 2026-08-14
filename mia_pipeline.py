@@ -94,11 +94,19 @@ def submit_mia_manuscript_task(script: str, category: str) -> str:
     logger.info(f"[CAPTIONS] Font size: {cfg.MIA_CAPTION_FONT_SIZE}")
     logger.info(f"[CAPTIONS] Bottom margin: {cfg.MIA_CAPTION_BOTTOM_MARGIN_PX}px "
                 f"(final) / {cfg.MIA_CAPTION_BOTTOM_MARGIN_PX_GEN}px (generation res)")
+
+    # Explicit negative prompt to reinforce single-character stability across scenes
+    identity_negative_prompt = (
+        "different person, altered face, morphing features, identity shift, "
+        "changing facial structure, distorted face, inconsistent character"
+    )
+
     payload = {
         "manuscript_text": script,
         "reference_image": cfg.MIA_REFERENCE_IMAGE,
         "character_style": cfg.MIA_CHARACTER_STYLE_FOR_SCENES,
         "character_seed": cfg.MIA_SEED,
+        "negative_prompt": identity_negative_prompt,
         "video_width": cfg.MIA_GENERATION_WIDTH,
         "video_height": cfg.MIA_GENERATION_HEIGHT,
         "audio_voice": cfg.MIA_VOICE,

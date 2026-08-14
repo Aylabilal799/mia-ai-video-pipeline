@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -72,6 +73,27 @@ class AgnesVideoAPI:
         mime = mimetypes.guess_type(path)[0] or "image/png"
         return f"data:{mime};base64,{b64}"
 
+    @staticmethod
+    def _sha256_of_local_path(path: str) -> Optional[str]:
+        """Best-effort SHA256 of a local reference image file, for identity
+        traceability logging (IDENTITY TRACE requirement). Returns None for
+        non-local refs (http(s) URL, data: URI) or a path that doesn't
+        exist -- this is diagnostic only and must never block a real
+        submission.
+        """
+        try:
+            if not path or path.startswith(("http://", "https://", "data:")):
+                return None
+            if not os.path.exists(path):
+                return None
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
     async def _resolve_image_ref(self, ref: str) -> str:
         if ref.startswith(("http://", "https://")):
             return ref
@@ -79,7 +101,6 @@ class AgnesVideoAPI:
             return ref
         if os.path.exists(ref):
             url_file = ref + ".url"
-            # P12: 缓存过期检查（预签名 URL 有效期有限，超过 1 小时则重新上传）
             _URL_CACHE_MAX_AGE = 3600  # 1 小时
             if os.path.exists(url_file):
                 try:
@@ -100,7 +121,6 @@ class AgnesVideoAPI:
                         )
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug(f"[AgnesVideo] Failed to read cached URL: {e}")
-                # 兼容旧格式纯文本缓存文件
                 except Exception as e:
                     logger.debug(f"[AgnesVideo] Failed to read legacy URL cache: {e}")
             url = await self._upload_image_to_url(ref)
@@ -165,7 +185,6 @@ class AgnesVideoAPI:
                     await asyncio.sleep(15)
         return None
 
-    # API frame limits by resolution tier (from Agnes API error messages)
     _FRAME_LIMITS = {
         "1080p": 169,
         "720p": 409,
@@ -183,15 +202,15 @@ class AgnesVideoAPI:
         else:
             return 961   # 480p tier
 
-    def _get_frame_config(self, duration: Optional[int] = None,
+    def _get_frame_config(self, duration: Optional[float] = None,
                           width: int = 1152, height: int = 768) -> tuple:
-        d = duration or self.default_duration
+        # Round duration to integer seconds safely for frame calculation
+        d = max(1, int(round(duration))) if duration is not None else self.default_duration
         max_nf = self._get_max_frames(width, height)
         if d in DURATION_PRESETS:
             nf, fr = DURATION_PRESETS[d]
             if nf <= max_nf:
                 return nf, fr
-            # preset exceeds limit for this resolution, cap it
             logger.warning(
                 f"[AgnesVideo] Duration preset {d}s has {nf} frames, "
                 f"exceeds {max_nf} for {width}x{height}. Capping."
@@ -217,7 +236,6 @@ class AgnesVideoAPI:
             f'"{get_agnes_api_root()}/agnesapi?video_id={video_id}"'
         )
         while True:
-            # M2: 每次轮询前检查停止信号
             if self.shutdown_event and self.shutdown_event.is_set():
                 raise RuntimeError("Video generation cancelled by user")
 
@@ -239,9 +257,7 @@ class AgnesVideoAPI:
             try:
                 if poll_count % 10 == 0:
                     logger.info(f"[AgnesVideo] Polling video {video_id[:16]}... (poll #{poll_count + 1}, elapsed {elapsed:.0f}s)")
-                # 全局限速：每次轮询都消耗一个令牌
                 await asyncio.to_thread(get_rate_limiter().acquire)
-                # M2: 用 wait_for 包裹以支持取消
                 resp = await asyncio.wait_for(
                     asyncio.to_thread(
                         requests.get,
@@ -256,7 +272,7 @@ class AgnesVideoAPI:
                 status = result.get("status", "")
                 progress = result.get("progress", 0)
                 poll_count += 1
-                consecutive_failures = 0  # reset on success
+                consecutive_failures = 0
 
                 if status != last_status:
                     logger.info(f"[AgnesVideo] Video {video_id[:16]}... status={status} progress={progress}%")
@@ -285,7 +301,6 @@ class AgnesVideoAPI:
                 logger.warning(
                     f"[AgnesVideo] Poll error ({consecutive_failures}/{max_consecutive_failures}): {e}"
                 )
-                # 每次轮询失败都记录
                 collect_error_from_exception(
                     "video", "poll_task",
                     exc=e, prompt=curl_cmd,
@@ -308,15 +323,13 @@ class AgnesVideoAPI:
             await asyncio.sleep(interval)
 
     async def _submit_with_retry(self, payload: dict, mode_desc: str) -> str:
-        frame_reductions_left = 2  # allow up to 2 frame-count reductions on 400
+        frame_reductions_left = 2
         for attempt in range(self.max_retries):
             if self.shutdown_event and self.shutdown_event.is_set():
                 raise RuntimeError("Video generation cancelled by user")
             try:
                 logger.info(f"[AgnesVideo] Submitting {mode_desc} (attempt {attempt + 1}/{self.max_retries})...")
-                # 全局限速：在发起提交请求前获取令牌
                 await asyncio.to_thread(get_rate_limiter().acquire)
-                # M2: 缩短读超时从 180s 到 60s，使 stop() 更快生效
                 resp = await asyncio.wait_for(
                     asyncio.to_thread(
                         requests.post,
@@ -372,7 +385,6 @@ class AgnesVideoAPI:
                     await asyncio.sleep(delay)
                     continue
 
-                # HTTP 400 with num_frames exceeded → reduce frames and retry
                 error_text = resp.text[:500]
                 if (resp.status_code == 400
                         and "num_frames" in error_text
@@ -413,7 +425,6 @@ class AgnesVideoAPI:
 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
                         asyncio.TimeoutError) as e:
-                # 每次失败都记录（包括中间重试）
                 collect_error_from_exception(
                     "video", "submit_video",
                     exc=e, prompt=payload.get("prompt", ""),
@@ -446,12 +457,13 @@ class AgnesVideoAPI:
         self,
         prompt: str,
         reference_image_paths: List[str] = [],
-        duration: Optional[int] = None,
+        duration: Optional[float] = None,
         width: int = 1152,
         height: int = 768,
         seed: Optional[int] = None,
         negative_prompt: Optional[str] = None,
         progress_callback=None,
+        scene_label: Optional[str] = None,
         **kwargs,
     ) -> VideoOutput:
         video_id = await self.submit_video(
@@ -462,6 +474,7 @@ class AgnesVideoAPI:
             height=height,
             seed=seed,
             negative_prompt=negative_prompt,
+            scene_label=scene_label,
             **kwargs,
         )
         return await self.wait_for_video(video_id, progress_callback)
@@ -470,11 +483,12 @@ class AgnesVideoAPI:
         self,
         prompt: str,
         reference_image_paths: List[str] = [],
-        duration: Optional[int] = None,
+        duration: Optional[float] = None,
         width: int = 1152,
         height: int = 768,
         seed: Optional[int] = None,
         negative_prompt: Optional[str] = None,
+        scene_label: Optional[str] = None,
         **kwargs,
     ) -> str:
         num_frames, frame_rate = self._get_frame_config(duration, width, height)
@@ -498,6 +512,7 @@ class AgnesVideoAPI:
             resolved_refs.append(await self._resolve_image_ref(p))
         n_refs = len(resolved_refs)
 
+        # Explicit mode routing: Exactly 1 image triggers ti2vid (image-to-video)
         if n_refs == 0:
             mode_desc = "text-to-video"
         elif n_refs == 1:
@@ -510,6 +525,20 @@ class AgnesVideoAPI:
                 "mode": "keyframes",
             }
             mode_desc = f"keyframes ({n_refs} frames)"
+
+        # IDENTITY TRACE: log scene number, reference image path(s), SHA256
+        # of each local reference file, ref count, and the generation mode
+        # about to be used -- required so identity drift between scenes can
+        # be diagnosed from logs alone (path reused vs. actually different
+        # bytes vs. silently zero references / wrong mode).
+        ref_fingerprints = [
+            {"path": p, "sha256": self._sha256_of_local_path(p)}
+            for p in reference_image_paths
+        ]
+        logger.info(
+            "[AgnesVideo][IdentityTrace] scene=%s mode=%s n_refs=%d refs=%s",
+            scene_label or "unlabeled", mode_desc, n_refs, ref_fingerprints,
+        )
 
         logger.info(f"[AgnesVideo] {mode_desc}: {prompt[:80]}...")
 

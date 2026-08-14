@@ -14,6 +14,14 @@ import srt
 logger = logging.getLogger(__name__)
 
 
+def _is_punctuation_only_word(text: str) -> bool:
+    """True if a caption word token has no alphanumeric characters (e.g.
+    '.', ',', '-', '...'). Used by validate_and_fix_karaoke_data to flag
+    any standalone-punctuation caption group that shouldn't be visible on
+    its own."""
+    return bool(text) and not any(ch.isalnum() for ch in text)
+
+
 # ── 细粒度字幕分割参数 ──
 # 每条字幕最大持续时长（秒）/ 最大字符数 — used for (a) the fallback plain-SRT
 # path when karaoke word-highlight data isn't available, and (b) as the
@@ -434,7 +442,62 @@ class SubtitleSrtMixin:
                 "end": group[-1][1],
                 "words": [{"text": w[2], "start": w[0], "end": w[1]} for w in group],
             })
+        lines, issues = SubtitleGenerator.validate_and_fix_karaoke_data(lines)
+        if issues:
+            logger.warning(
+                "[Karaoke] Validation found %d issue(s), auto-fixed where possible: %s",
+                len(issues), "; ".join(issues[:10]),
+            )
         return lines
+
+    @staticmethod
+    def validate_and_fix_karaoke_data(lines: list) -> Tuple[list, List[str]]:
+        """Validates karaoke caption groups against the hard requirements
+        (max 4 words/group, no standalone-punctuation group, no duplicated
+        consecutive word within a group, timestamps present and
+        non-decreasing). Over-length groups (which should not occur given
+        the grouping function above, but this is a last-line defense in
+        depth) are auto-split into <=4-word chunks; everything else is only
+        reported, not silently altered, so caption text/order is never
+        changed. Returns (possibly-fixed lines, list of human-readable issue
+        descriptions found).
+        """
+        issues: List[str] = []
+        fixed: list = []
+
+        for idx, line in enumerate(lines):
+            words = line.get("words") or []
+            if not words:
+                continue
+
+            # Auto-fix: hard-split any group that slipped through >4 words.
+            chunks = [words[i:i + 4] for i in range(0, len(words), 4)] or [words]
+            if len(chunks) > 1:
+                issues.append(f"line {idx}: {len(words)} words, auto-split into {len(chunks)} groups")
+
+            for chunk in chunks:
+                texts = [w.get("text", "") for w in chunk]
+                if any(_is_punctuation_only_word(t) for t in texts):
+                    issues.append(f"line {idx}: standalone-punctuation word in group {texts!r}")
+                for a, b in zip(texts, texts[1:]):
+                    if a and a.lower() == b.lower():
+                        issues.append(f"line {idx}: duplicated consecutive word {a!r}")
+                starts = [w.get("start") for w in chunk]
+                ends = [w.get("end") for w in chunk]
+                if any(s is None or e is None for s, e in zip(starts, ends)):
+                    issues.append(f"line {idx}: missing timestamp in group {texts!r}")
+                else:
+                    timeline = [v for pair in zip(starts, ends) for v in pair]
+                    if any(b < a for a, b in zip(timeline, timeline[1:])):
+                        issues.append(f"line {idx}: non-increasing timestamps in group {texts!r}")
+
+                fixed.append({
+                    "start": chunk[0]["start"],
+                    "end": chunk[-1]["end"],
+                    "words": chunk,
+                })
+
+        return fixed, issues
 
     @staticmethod
     def _group_items_to_srt(

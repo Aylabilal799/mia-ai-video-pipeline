@@ -32,9 +32,7 @@ MIA_CHARACTER_STYLE_FOR_SCENES = (
 )
 
 # Fixed identity anchor path and generation parameters
-MIA_REFERENCE_IMAGE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "assets", "mia_anchor.png"
-)
+MIA_REFERENCE_IMAGE = "assets/mia_anchor.png"
 MIA_SEED = 42
 
 MIA_GENERATION_WIDTH = 768
