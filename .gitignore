@@ -27,3 +27,7 @@ mia_config.py.bak
 
 # Wav2Lip local checkout
 wav2lip/Wav2Lip/
+
+# YouTube OAuth credentials
+youtube_client_secret.json
+youtube_token.json
