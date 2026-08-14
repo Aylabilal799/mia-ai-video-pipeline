@@ -20,3 +20,10 @@ cache/
 *.webm
 celerybeat-schedule
 *.pid
+
+# Generated/runtime files
+shared_videos/
+mia_config.py.bak
+
+# Wav2Lip local checkout
+wav2lip/Wav2Lip/
