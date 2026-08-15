@@ -115,10 +115,7 @@ _REFERENCE_LEAK_HAMMING_THRESHOLD = 3.0
 # FIX #4 -- reference-image lead-in strip. Agnes's image-to-video mode
 # anchors the first frame(s) of a freshly generated clip to the exact
 # conditioning/reference image before real motion starts. That lead-in must
-# never reach the final composited video as scene content. These control
-# how far into a clip (and at what sampling resolution) we scan for that
-# leading run of reference-matching frames before giving up and treating a
-# still-matching window as a genuine generation failure instead.
+# never reach the final composited video as scene content.
 #
 # FIX #4b -- lead-in scan MUST be treated as authoritative, not best-effort.
 # The original implementation broke out of the scan loop identically
@@ -134,8 +131,31 @@ _REFERENCE_LEAK_HAMMING_THRESHOLD = 3.0
 # and an extraction failure is NEVER treated as "clip is clean" -- see its
 # docstring and both call sites in `_generate_videos` /
 # `_validate_and_regenerate_scene`.
-_REFERENCE_LEADIN_MAX_SCAN_SECONDS = 1.5
-_REFERENCE_LEADIN_SAMPLE_STEP_SECONDS = 0.15
+#
+# FIX #5 -- anchor-only (aHash-vs-reference) lead-in detection was confirmed
+# by diagnostic to miss real lead-ins: the Agnes lead-in frame is visibly
+# the identity-conditioning frame, but its aHash distance to the canonical
+# static PNG (mia_anchor.png) is too large to register as a "match" (87/63/92,
+# 86/84/86, 86/83/79 against a threshold of 3.0 -- raising the threshold to
+# catch these would also start catching real scene frames of the same
+# woman). The lead-in is a TEMPORAL phenomenon -- a near-frozen frame held
+# before real motion starts -- so it's detected that way instead: by diffing
+# consecutive sampled frames against each other (not against the reference
+# image) and finding where sustained motion begins. `_frame_matches_reference`
+# is kept only as a secondary safety check after trimming (FIX #4's
+# requirement 7), not as the primary detector.
+_LEADIN_SCAN_WINDOW_SECONDS = 0.6
+_LEADIN_SAMPLE_STEP_SECONDS = 0.05
+# Consecutive-frame aHash distance at/below this is "no visible motion".
+# Deliberately looser than _REFERENCE_LEAK_HAMMING_THRESHOLD: two
+# back-to-back frames of a genuinely frozen/near-frozen lead-in should be
+# nearly identical to each other (even if neither is a tight match to the
+# static reference PNG).
+_LEADIN_STATIC_HAMMING_THRESHOLD = 4.0
+# Require this many consecutive above-threshold (moving) frame-pairs before
+# calling it "sustained real motion" -- a single noisy/compression-artifact
+# frame pair should not be mistaken for motion starting.
+_LEADIN_SUSTAINED_MOTION_SAMPLES = 2
 
 
 class ManuscriptVideoPipeline(MultiScenePipeline):
@@ -952,6 +972,40 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             return False
 
     @staticmethod
+    def _frame_motion_diff(frame_path_a: str, frame_path_b: str) -> Optional[float]:
+        """FIX #5. Average-hash Hamming distance between two CONSECUTIVE
+        sampled frames from the same clip (not against the reference image).
+
+        This is the primary lead-in detector: a frozen/near-frozen
+        identity-conditioning lead-in produces a near-zero distance between
+        consecutive frames, regardless of how far that frozen frame's own
+        hash sits from the canonical static reference PNG (which is the
+        gap that let the anchor-only detector miss real lead-ins).
+
+        Returns None (not "no motion") if either frame is unreadable, so
+        callers can distinguish "confirmed static" from "couldn't tell" --
+        fails open the same way `_frame_matches_reference` does, since this
+        is also a safety guard and must never itself block the pipeline.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            return None
+        try:
+            def ahash(path):
+                img = Image.open(path).convert("L").resize((16, 16))
+                pixels = list(img.getdata())
+                avg = sum(pixels) / len(pixels)
+                return [1 if p > avg else 0 for p in pixels]
+
+            h1 = ahash(frame_path_a)
+            h2 = ahash(frame_path_b)
+            return float(sum(a != b for a, b in zip(h1, h2)))
+        except Exception:
+            logger.debug("[Manuscript] frame motion-diff comparison failed", exc_info=True)
+            return None
+
+    @staticmethod
     async def _extract_mid_frame(video_path: str, frame_path: str) -> bool:
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1030,110 +1084,209 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             logger.exception("[DIAG][%s] Scene %d: diagnostic logging itself failed", tag, para.index)
 
     async def _strip_reference_leadin(self, para: ManuscriptParagraph, video_path: str) -> bool:
-        """FIX #4. Agnes's image-to-video mode anchors a freshly generated
+        """FIX #5. Agnes's image-to-video mode anchors a freshly generated
         clip's first frame(s) to the exact conditioning/reference image
-        before real motion starts -- confirmed by hash-scanning an actual
-        output video, where the leading ~0.2-0.4s of scene clips matched
-        the canonical anchor image at near-zero Hamming distance. That
-        lead-in is a valid identity-locking artifact of generation, but it
-        must never reach the final composited video as scene content.
+        before real motion starts. That lead-in must never reach the final
+        composited video as scene content.
 
-        This scans the first _REFERENCE_LEADIN_MAX_SCAN_SECONDS of the
-        SAVED clip file (in place, immediately after Agnes writes it) and
-        trims off any leading run of frames that match the reference image,
-        before the clip is validated, duration-conformed, or concatenated.
+        Diagnostic on a real generated video confirmed the lead-in frames
+        are NOT reliably close to the canonical anchor PNG by average-hash
+        (Hamming distances of 87/63/92, 86/84/86, 86/83/79 against a
+        match threshold of 3.0) -- so anchor-only detection silently did
+        nothing. The lead-in is a TEMPORAL phenomenon instead: a
+        near-frozen frame held before real motion starts. This detects it
+        that way:
 
-        If the entire scan window still matches the reference image, this
-        intentionally does nothing -- that's a real generation failure (no
-        motion was ever produced), not a trimmable lead-in, and is left to
-        the existing reference-match guard in `_check_scene_video` to fail
-        the scene properly rather than being silently deleted here.
+          1. Sample the first `_LEADIN_SCAN_WINDOW_SECONDS` of the clip at
+             `_LEADIN_SAMPLE_STEP_SECONDS` intervals.
+          2. Diff each consecutive pair of sampled frames against each
+             other (NOT against the reference image) via
+             `_frame_motion_diff`.
+          3. Find the first point where motion is SUSTAINED for
+             `_LEADIN_SUSTAINED_MOTION_SAMPLES` consecutive intervals
+             (a single moving frame-pair is treated as noise, not motion).
+          4. Trim everything before that point.
+          5. Re-extract the trimmed clip's first two frames and re-check:
+             if they're still near-static to each other, OR the first
+             frame still matches the reference image (`_frame_matches_reference`,
+             used here only as a secondary safety net, not the primary
+             detector), the scene is rejected outright so the caller
+             regenerates it rather than shipping a clip that still opens
+             on a frozen/reference-like frame.
 
         Returns:
             True  -- the clip is CONFIRMED clean: either no lead-in was
-                     found (scan sampled real, non-reference frames), the
-                     entire scan window still matched (handed off to
-                     `_check_scene_video` to fail properly), or a detected
-                     lead-in was successfully trimmed.
-            False -- the clip could NOT be confirmed clean. Either a
-                     detected lead-in existed but ffmpeg failed to trim it,
-                     OR -- critically -- a scan frame could not even be
-                     extracted (e.g. the clip wasn't fully flushed yet, a
-                     bad seek, a transient ffmpeg error). A failed
-                     extraction is NEVER treated as "no lead-in here": that
-                     conflation is what previously let reference frames
-                     reach the final video silently. Callers must fail this
-                     scene (retry or drop it) rather than proceed, per the
-                     requirement to never insert the anchor image into
-                     scene output.
+                     found (motion was already sustained from the first
+                     sampled frame), a detected lead-in was trimmed and the
+                     re-check found real motion at the new start, or the
+                     whole scan window was ambiguous/ongoing motion that
+                     didn't read as a frozen reference lead-in (left to
+                     `_check_scene_video`'s existing checks).
+            False -- the clip could NOT be confirmed clean and this scene
+                     should be treated as a failed attempt (retried/
+                     regenerated) rather than shipped. This covers: a scan
+                     frame could not be extracted; a detected lead-in
+                     existed but ffmpeg failed to trim it; the entire scan
+                     window was static AND matched the reference image
+                     (lead-in extends past what we can measure); or the
+                     trimmed clip's start is still static/reference-like
+                     after trimming.
         """
         ref_paths = self._get_identity_reference_paths()
         if not ref_paths or not os.path.exists(video_path):
             return True
         ref_image_path = ref_paths[0]
 
-        cutoff = 0.0
-        matched_any = False
-        extraction_failed = False
+        sample_times: List[float] = []
         t = 0.0
-        while t <= _REFERENCE_LEADIN_MAX_SCAN_SECONDS:
-            frame_path = f"{video_path}.leadin_{t:.2f}.jpg"
-            if not await self._extract_frame_at(video_path, frame_path, t):
-                # NOT the same as "real motion started". We genuinely don't
-                # know whether this frame would have matched the reference
-                # or not, so we cannot certify the clip as clean.
-                extraction_failed = True
-                break
-            is_match = self._frame_matches_reference(frame_path, ref_image_path)
-            if os.path.exists(frame_path):
-                os.remove(frame_path)
-            if not is_match:
-                break
-            matched_any = True
-            cutoff = t + _REFERENCE_LEADIN_SAMPLE_STEP_SECONDS
-            t += _REFERENCE_LEADIN_SAMPLE_STEP_SECONDS
-        else:
-            # Every sampled frame in the scan window matched the reference --
-            # leave the clip untouched; _check_scene_video will fail it.
-            return True
+        while t <= _LEADIN_SCAN_WINDOW_SECONDS + 1e-9:
+            sample_times.append(round(t, 3))
+            t += _LEADIN_SAMPLE_STEP_SECONDS
 
-        if extraction_failed:
-            logger.warning(
-                "[Manuscript] Scene %d: could not extract frame(s) while scanning for "
-                "reference lead-in at %.2fs -- cannot confirm clip is free of the anchor "
-                "image, failing this attempt rather than risk shipping it",
-                para.index, t,
+        sample_paths: List[str] = []
+        for i, ts in enumerate(sample_times):
+            frame_path = f"{video_path}.motionscan_{i:02d}.jpg"
+            if not await self._extract_frame_at(video_path, frame_path, ts):
+                for p in sample_paths:
+                    if os.path.exists(p):
+                        os.remove(p)
+                logger.warning(
+                    "[Manuscript] Scene %d: could not extract frame(s) while scanning for "
+                    "lead-in motion at %.2fs -- cannot confirm clip is free of the anchor "
+                    "image, failing this attempt rather than risk shipping it",
+                    para.index, ts,
+                )
+                return False
+            sample_paths.append(frame_path)
+
+        # Consecutive-frame diffs. moving[i] describes the interval between
+        # sample_times[i] and sample_times[i+1].
+        moving: List[bool] = []
+        for i in range(len(sample_paths) - 1):
+            diff = self._frame_motion_diff(sample_paths[i], sample_paths[i + 1])
+            # Fails open: if we can't compute a diff, don't treat it as a
+            # frozen interval (never let an inconclusive measurement widen
+            # what gets silently trimmed/rejected).
+            moving.append(diff is None or diff > _LEADIN_STATIC_HAMMING_THRESHOLD)
+
+        first_motion_index: Optional[int] = None
+        for i in range(len(moving) - _LEADIN_SUSTAINED_MOTION_SAMPLES + 1):
+            if all(moving[i:i + _LEADIN_SUSTAINED_MOTION_SAMPLES]):
+                first_motion_index = i
+                break
+
+        for p in sample_paths:
+            if os.path.exists(p):
+                os.remove(p)
+
+        if first_motion_index == 0:
+            # Real motion is already present in the very first sampled
+            # interval -- no lead-in to trim.
+            logger.info(
+                "[Manuscript] Scene %d: no lead-in detected (motion present from t=0.00s)",
+                para.index,
             )
-            return False
-
-        if not matched_any or cutoff <= 0.0:
             return True
+
+        if first_motion_index is None:
+            # Never found sustained motion inside the scan window. Either
+            # the whole window is a frozen lead-in longer than we scanned
+            # (reference-check will tell us), or this is just very
+            # low-motion real footage -- in which case we must not touch it.
+            first_frame_path = f"{video_path}.motioncheck_start.jpg"
+            still_frozen_and_referencelike = False
+            if await self._extract_frame_at(video_path, first_frame_path, 0.0):
+                still_frozen_and_referencelike = self._frame_matches_reference(first_frame_path, ref_image_path)
+                if os.path.exists(first_frame_path):
+                    os.remove(first_frame_path)
+            logger.warning(
+                "[Manuscript] Scene %d: no sustained motion found within %.2fs scan window "
+                "(detected_leadin_seconds=%.2f, first_motion_seconds=None)",
+                para.index, _LEADIN_SCAN_WINDOW_SECONDS, _LEADIN_SCAN_WINDOW_SECONDS,
+            )
+            if still_frozen_and_referencelike:
+                logger.warning(
+                    "[Manuscript] Scene %d: entire scan window is static AND matches the "
+                    "reference image -- lead-in likely extends past the scan window, "
+                    "rejecting scene rather than shipping unconfirmed content",
+                    para.index,
+                )
+                return False
+            # Static but not reference-like: treat as real (if very calm)
+            # scene content and leave it alone.
+            return True
+
+        detected_leadin_seconds = sample_times[first_motion_index]
+        first_motion_seconds = sample_times[first_motion_index + 1]
+        logger.info(
+            "[Manuscript] Scene %d: lead-in detected (detected_leadin_seconds=%.2f, "
+            "first_motion_seconds=%.2f)",
+            para.index, detected_leadin_seconds, first_motion_seconds,
+        )
 
         base, ext = os.path.splitext(video_path)
         trimmed_path = f"{base}_noleadin{ext or '.mp4'}"
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-ss", f"{cutoff:.3f}", "-i", video_path,
+                "ffmpeg", "-y", "-ss", f"{first_motion_seconds:.3f}", "-i", video_path,
                 trimmed_path,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.communicate(), timeout=60)
-            if proc.returncode == 0 and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 10_000:
-                os.replace(trimmed_path, video_path)
-                logger.info(
-                    "[Manuscript] Scene %d: stripped %.2fs of reference-image lead-in from clip",
-                    para.index, cutoff,
+            if not (proc.returncode == 0 and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 10_000):
+                logger.warning(
+                    "[Manuscript] Scene %d: could not strip detected lead-in (ffmpeg failed), "
+                    "cannot confirm clip is clean",
+                    para.index,
                 )
-                return True
-            logger.warning(
-                "[Manuscript] Scene %d: could not strip reference lead-in (ffmpeg failed), "
-                "cannot confirm clip is clean",
-                para.index,
+                if os.path.exists(trimmed_path):
+                    os.remove(trimmed_path)
+                return False
+            os.replace(trimmed_path, video_path)
+            logger.info(
+                "[Manuscript] Scene %d: stripped %.2fs of lead-in from clip",
+                para.index, first_motion_seconds,
             )
-            return False
         except Exception:
-            logger.exception("[Manuscript] Scene %d: error stripping reference lead-in", para.index)
+            logger.exception("[Manuscript] Scene %d: error stripping lead-in", para.index)
+            if os.path.exists(trimmed_path):
+                os.remove(trimmed_path)
             return False
+
+        # Re-check the trimmed clip's new start. Reject (caller regenerates
+        # the scene) if it's still static/reference-like -- trimming to the
+        # detected motion point clearly wasn't enough.
+        recheck_path_0 = f"{video_path}.motionrecheck_00.jpg"
+        recheck_path_1 = f"{video_path}.motionrecheck_01.jpg"
+        try:
+            extracted_0 = await self._extract_frame_at(video_path, recheck_path_0, 0.0)
+            extracted_1 = await self._extract_frame_at(video_path, recheck_path_1, _LEADIN_SAMPLE_STEP_SECONDS)
+            if not (extracted_0 and extracted_1):
+                logger.warning(
+                    "[Manuscript] Scene %d: could not extract post-trim re-check frame(s), "
+                    "cannot confirm trimmed clip is clean",
+                    para.index,
+                )
+                return False
+
+            still_matches_reference = self._frame_matches_reference(recheck_path_0, ref_image_path)
+            recheck_diff = self._frame_motion_diff(recheck_path_0, recheck_path_1)
+            still_static = recheck_diff is not None and recheck_diff <= _LEADIN_STATIC_HAMMING_THRESHOLD
+
+            if still_matches_reference or still_static:
+                logger.warning(
+                    "[Manuscript] Scene %d: trimmed clip still opens static/reference-like "
+                    "(matches_reference=%s, still_static=%s) -- rejecting scene for "
+                    "regeneration rather than shipping it",
+                    para.index, still_matches_reference, still_static,
+                )
+                return False
+
+            return True
+        finally:
+            for p in (recheck_path_0, recheck_path_1):
+                if os.path.exists(p):
+                    os.remove(p)
 
     @staticmethod
     async def _probe_duration(video_path: str) -> Optional[float]:
