@@ -27,17 +27,6 @@ from models.task import (
 logger = logging.getLogger(__name__)
 
 
-def _lipsync_enabled() -> bool:
-    """Lip-sync (Wav2Lip) is OFF by default. Current pipeline direction is
-    voiceover narration + AI-generated lifestyle visuals + karaoke captions,
-    not forced mouth-sync -- this was a deliberate product decision (Wav2Lip
-    was failing/OOMing on CPU and its payoff for Shorts retention is
-    unproven). Set AGNES_ENABLE_LIPSYNC=1 in the environment to re-enable
-    later if analytics show it's actually needed.
-    """
-    return os.environ.get("AGNES_ENABLE_LIPSYNC", "0").strip() == "1"
-
-
 _SENTENCE_END_RE = re.compile(r"(?<=[。！？])|(?<=[.!?])\s+")
 
 _CHARS_PER_SEC_BY_SCRIPT = {
@@ -144,8 +133,49 @@ _REFERENCE_LEAK_HAMMING_THRESHOLD = 3.0
 # image) and finding where sustained motion begins. `_frame_matches_reference`
 # is kept only as a secondary safety check after trimming (FIX #4's
 # requirement 7), not as the primary detector.
-_LEADIN_SCAN_WINDOW_SECONDS = 0.6
+#
+# FIX #6 -- the 0.6s scan window was itself too short: real clips were
+# observed freezing on the identity-conditioning frame for ~0.8-1.0s+,
+# past the end of the old window, so `first_motion_index` came back None
+# and the scene fell through to the (already-known-broken, see FIX #5)
+# `_frame_matches_reference` fallback, which almost never matches a real
+# lead-in frame -- so the freeze shipped straight into the final video
+# looking like a repeated/static "anchor pic" at the start of the scene.
+# Widened the window to 2.0s (covers realistic lead-in durations with
+# headroom) and the fallback for "no motion found anywhere in the window"
+# no longer trusts the aHash reference-match to decide "this is fine,
+# it's just calm real footage" -- it now REJECTS unconditionally (returns
+# False, scene gets regenerated) any time the whole scan window is static,
+# since that fallback was proven unable to reliably tell a calm real scene
+# apart from an unstripped lead-in. See `_strip_reference_leadin`.
+_LEADIN_SCAN_WINDOW_SECONDS = 2.0
 _LEADIN_SAMPLE_STEP_SECONDS = 0.05
+
+# FIX #7 -- FIX #6 only fixed SUSTAINED freezes (multiple consecutive
+# static frames). Direct native-framerate inspection of a real composited
+# video showed a SHORTER failure mode FIX #6 does not cover at all: just
+# 1-2 raw frames at the very start of a scene are the literal
+# reference-conditioning frame (visually near-identical to mia_anchor.png
+# -- same plain backdrop, same front-facing chest-up pose), immediately
+# followed by real motion. Because real motion starts inside the very
+# first sampled interval, the old logic's `first_motion_index == 0` branch
+# read that as "no lead-in, motion from t=0" and shipped it -- it only
+# ever measured motion BETWEEN consecutive sampled frames and never
+# checked whether frame 0 itself was still the conditioning frame.
+#
+# Fixed two ways:
+#   (a) UNCONDITIONAL pre-trim: Agnes's ti2vid mode is documented to
+#       condition generation on the reference image, so the first
+#       `_LEADIN_UNCONDITIONAL_TRIM_SECONDS` of every freshly generated
+#       clip are trimmed before any detection runs at all -- this does
+#       not depend on correctly classifying a frame via image hashing
+#       (proven unreliable twice now, see FIX #5) and removes the
+#       observed 1-2 frame leak with margin.
+#   (b) The `first_motion_index == 0` branch (on the now-pretrimmed clip)
+#       additionally runs a direct reference-image check on the new
+#       frame 0 as a secondary safety net, instead of trusting "motion
+#       started immediately" alone -- see `_strip_reference_leadin`.
+_LEADIN_UNCONDITIONAL_TRIM_SECONDS = 0.15
 # Consecutive-frame aHash distance at/below this is "no visible motion".
 # Deliberately looser than _REFERENCE_LEAK_HAMMING_THRESHOLD: two
 # back-to-back frames of a genuinely frozen/near-frozen lead-in should be
@@ -468,105 +498,77 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 _PROGRESS_SCENE_PROMPTS_START + _PROGRESS_SCENE_PROMPTS_SPAN * (i / max(total, 1)),
             )
 
-            # Talking-to-camera shots are only generated when lip-sync is
-            # actually enabled. With lip-sync off (the current default),
-            # generating a close-up "talking directly to camera" shot with
-            # no real mouth-sync just draws attention to the mismatch, so
-            # every scene uses natural lifestyle/B-roll framing instead
-            # (spec section 12: avoid fake talking shots without lipsync).
-            is_talking_scene = _lipsync_enabled() and ((i % 2 == 1) or (total == 1))
-
-            if is_talking_scene:
-                prompt_instructions = (
-                    f"Narration line: \"{para.text}\"\n"
-                    f"Scene {i+1} of {total} in a mini-vlog video.\n"
-                    "Create a clear visual prompt featuring Mia in a realistic 9:16 vlog shot.\n"
-                    "- Mia is talking DIRECTLY TO CAMERA, as if speaking this exact line to her "
-                    "audience. Her full face must be clearly visible and unobstructed (no hand, "
-                    "hair, or object covering her mouth), facing or nearly facing the lens, in a "
-                    "medium close-up or chest-up framing.\n"
-                    "- Read the narration line above and pick a speaking expression and demeanor "
-                    "that actually match what is being narrated -- not a default reaction reused "
-                    "for every line. For example: surprising or bad news -> genuine surprise or "
-                    "concern, not smiling; rushing or running late -> visibly hurried, energetic "
-                    "delivery; thinking, deciding, or waiting -> neutral or thoughtful; discovering "
-                    "or noticing something -> natural curiosity; enjoying something small like a "
-                    "coffee -> relaxed, subtle happiness, not a big grin; something funny or "
-                    "embarrassing -> a natural small laugh or smile, not exaggerated; a calm or "
-                    "peaceful moment -> a genuine, settled expression. Do NOT default to a constant "
-                    "happy smile regardless of content, and avoid exaggerated, theatrical acting.\n"
-                    "- Natural, animated speaking expression and subtle head/hand gestures while "
-                    "she talks -- not a static, frozen pose, and not an exaggerated grin held for "
-                    "the whole shot.\n"
-                    "- Handheld selfie-vlog camera style, slight natural handheld motion.\n"
-                    "- She is the exact same woman shown in the provided reference image -- do not "
-                    "change her face, facial structure, eyes/nose/lips, hair identity/hairstyle, "
-                    "apparent age, or overall character identity. Her clothing/outfit MAY vary "
-                    "naturally between scenes -- wardrobe changes are allowed and expected.\n"
-                    "\n"
-                    "HARD REQUIREMENT: the prompt you write MUST make it obvious, just from reading "
-                    "it, which specific moment of the narration line above it depicts. A generic "
-                    "prompt that would look correct on almost any other line of this script is a "
-                    "FAILURE and must not be produced."
-                )
-            else:
-                prompt_instructions = (
-                    f"Narration line: \"{para.text}\"\n"
-                    f"Scene {i+1} of {total} in a mini-vlog video.\n"
-                    "Create a clear visual prompt featuring Mia in a realistic 9:16 vlog shot.\n"
-                    "\n"
-                    "First, work out from the narration line above:\n"
-                    "  1. ACTION -- the concrete physical thing she is doing right now that this "
-                    "line describes (e.g. approaching a queue, receiving a drink, sitting by a "
-                    "window, unboxing something, walking somewhere specific) -- not a generic "
-                    "attractive pose. Extract this from what the line actually says, whatever the "
-                    "topic of this particular script is.\n"
-                    "  2. EXPRESSION -- the facial expression and demeanor a real person would "
-                    "naturally have while this is happening, matched to what the line is actually "
-                    "narrating -- never apply the same reaction to every line. For example: "
-                    "surprising or bad news -> genuine surprise or concern, not a smile; rushing or "
-                    "running late -> visibly hurried, urgent energy; thinking, deciding, or waiting "
-                    "-> a neutral or thoughtful expression; discovering or noticing something -> "
-                    "natural curiosity; enjoying something small like a coffee or a nice moment -> "
-                    "relaxed, subtle happiness, not a big grin; something funny or embarrassing -> a "
-                    "natural small laugh or smile, not exaggerated; a calm or peaceful ending -> a "
-                    "genuine, settled expression. Do NOT default to a smile -- only use a smile if "
-                    "the line's content actually calls for one, and keep it subtle rather than a "
-                    "constant camera-facing grin. Avoid exaggerated, theatrical acting.\n"
-                    "  3. EYE DIRECTION -- where she is naturally looking given the action (e.g. at "
-                    "the object/place/person the line describes, into the distance, down at what "
-                    "she's holding). She should be looking at what she's doing, NOT at the camera, "
-                    "unless the action itself would naturally involve a brief glance toward it.\n"
-                    "  4. BODY LANGUAGE -- posture/gesture consistent with the action and mood (e.g. "
-                    "leaning slightly forward, relaxed shoulders, hands around a cup, casual stride, "
-                    "or visibly quicker/urgent movement if she's rushing) rather than a static, "
-                    "frozen posed stance.\n"
-                    "Then write the visual prompt so it clearly conveys all four of those, specific "
-                    "to THIS line -- never reuse the same expression/action/pose you'd use for a "
-                    "different line just because it's also Mia in a vlog.\n"
-                    "\n"
-                    "- Handheld vlog camera style, medium or three-quarter shot, smooth natural "
-                    "movement, one clear main action per scene.\n"
-                    "- If other people appear in the background, keep it to a SMALL number (roughly "
-                    "2-5, fewer for a quiet/indoor setting), each moving at a natural, realistic "
-                    "walking pace. Do not describe a large crowd or dozens of pedestrians. Avoid "
-                    "background people freezing mid-motion, looping the same movement, teleporting "
-                    "position, sliding instead of stepping, or walking through the main character. "
-                    "Background presence should stay secondary to Mia -- she remains the visual "
-                    "focus of the shot.\n"
-                    "- She is the exact same woman shown in the provided reference image -- do not "
-                    "change her face, facial structure, eyes/nose/lips, hair identity/hairstyle, "
-                    "apparent age, or overall character identity. Her clothing/outfit MAY vary "
-                    "naturally between scenes to suit the action -- wardrobe changes are allowed "
-                    "and expected, not an identity failure.\n"
-                    "\n"
-                    "HARD REQUIREMENT: the prompt you write MUST make it obvious, just from reading "
-                    "it, which specific moment of the narration line above it depicts. A generic "
-                    "prompt that would look correct on almost any other line of this script (e.g. "
-                    "'woman walking through the city', 'woman smiling on a city street') is a "
-                    "FAILURE and must not be produced -- rewrite it around the concrete "
-                    "ACTION/EXPRESSION/EYE DIRECTION you worked out in steps 1-4 instead."
-                )
+            prompt_instructions = (
+                f"Narration line: \"{para.text}\"\n"
+                f"Scene {i+1} of {total} in a mini-vlog video.\n"
+                "This scene's own audio (the real narration for this exact line) will play "
+                "under the generated visuals -- there is no separate lip-sync pass, so the "
+                "video itself must show her actually PERFORMING this line, not just standing "
+                "near a matching backdrop.\n"
+                "\n"
+                "Create a clear visual prompt featuring Mia in a realistic 9:16 vlog shot.\n"
+                "\n"
+                "First, work out from the narration line above:\n"
+                "  1. ACTION -- the concrete physical thing she is doing right now that this "
+                "line describes (e.g. approaching a queue, receiving a drink, sitting by a "
+                "window, unboxing something, walking somewhere specific, or -- if the line "
+                "reads as something said directly to the audience -- turning toward camera to "
+                "say it). Extract this from what the line actually says, whatever the topic of "
+                "this particular script is; do not default to a generic attractive pose.\n"
+                "  2. EXPRESSION -- the facial expression and demeanor a real person would "
+                "naturally have while this is happening, matched to what the line is actually "
+                "narrating -- never apply the same reaction to every line. For example: "
+                "surprising or bad news -> genuine surprise or concern, not a smile; rushing or "
+                "running late -> visibly hurried, urgent energy; thinking, deciding, or waiting "
+                "-> a neutral or thoughtful expression; discovering or noticing something -> "
+                "natural curiosity; enjoying something small like a coffee or a nice moment -> "
+                "relaxed, subtle happiness, not a big grin; something funny or embarrassing -> a "
+                "natural small laugh or smile, not exaggerated; a calm or peaceful ending -> a "
+                "genuine, settled expression. Do NOT default to a smile -- only use a smile if "
+                "the line's content actually calls for one, and keep it subtle rather than a "
+                "constant camera-facing grin. Avoid exaggerated, theatrical acting.\n"
+                "  3. EYE DIRECTION -- where she is naturally looking given the action (e.g. at "
+                "the object/place/person the line describes, into the distance, down at what "
+                "she's holding, or toward the lens if this line is naturally addressed to the "
+                "audience/camera). Base this on the action itself, not a default.\n"
+                "  4. BODY LANGUAGE -- posture/gesture consistent with the action and mood (e.g. "
+                "leaning slightly forward, relaxed shoulders, hands around a cup, casual stride, "
+                "or visibly quicker/urgent movement if she's rushing) rather than a static, "
+                "frozen posed stance.\n"
+                "  5. DIALOGUE DELIVERY -- her mouth and jaw should move naturally as if she is "
+                "actually speaking this exact line in this exact moment (lips parting, natural "
+                "articulation), whatever the framing -- not a closed, silent expression. If the "
+                "shot is close enough to show her face clearly, this should read as her visibly "
+                "talking.\n"
+                "Then write the visual prompt so it clearly conveys all five of those, specific "
+                "to THIS line -- never reuse the same expression/action/pose you'd use for a "
+                "different line just because it's also Mia in a vlog.\n"
+                "\n"
+                "- Handheld vlog camera style, medium, three-quarter, or (when the line is "
+                "naturally addressed to the audience) chest-up selfie framing with her face "
+                "clearly visible and unobstructed -- smooth natural movement, one clear main "
+                "action per scene.\n"
+                "- If other people appear in the background, keep it to a SMALL number (roughly "
+                "2-5, fewer for a quiet/indoor setting), each moving at a natural, realistic "
+                "walking pace. Do not describe a large crowd or dozens of pedestrians. Avoid "
+                "background people freezing mid-motion, looping the same movement, teleporting "
+                "position, sliding instead of stepping, or walking through the main character. "
+                "Background presence should stay secondary to Mia -- she remains the visual "
+                "focus of the shot.\n"
+                "- She is the exact same woman shown in the provided reference image -- do not "
+                "change her face, facial structure, eyes/nose/lips, hair identity/hairstyle, "
+                "apparent age, or overall character identity. Her clothing/outfit MAY vary "
+                "naturally between scenes to suit the action -- wardrobe changes are allowed "
+                "and expected, not an identity failure.\n"
+                "\n"
+                "HARD REQUIREMENT: the prompt you write MUST make it obvious, just from reading "
+                "it, which specific moment of the narration line above it depicts. A generic "
+                "prompt that would look correct on almost any other line of this script (e.g. "
+                "'woman walking through the city', 'woman smiling on a city street') is a "
+                "FAILURE and must not be produced -- rewrite it around the concrete "
+                "ACTION/EXPRESSION/EYE DIRECTION/DIALOGUE DELIVERY you worked out in steps 1-5 "
+                "instead."
+            )
 
             prompt = await asyncio.to_thread(
                 self.screenwriter.generate_scene_prompt_for_paragraph,
@@ -1084,10 +1086,10 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             logger.exception("[DIAG][%s] Scene %d: diagnostic logging itself failed", tag, para.index)
 
     async def _strip_reference_leadin(self, para: ManuscriptParagraph, video_path: str) -> bool:
-        """FIX #5. Agnes's image-to-video mode anchors a freshly generated
-        clip's first frame(s) to the exact conditioning/reference image
-        before real motion starts. That lead-in must never reach the final
-        composited video as scene content.
+        """FIX #5/#6/#7. Agnes's image-to-video mode anchors a freshly
+        generated clip's first frame(s) to the exact conditioning/reference
+        image before real motion starts. That lead-in must never reach the
+        final composited video as scene content.
 
         Diagnostic on a real generated video confirmed the lead-in frames
         are NOT reliably close to the canonical anchor PNG by average-hash
@@ -1097,16 +1099,30 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         near-frozen frame held before real motion starts. This detects it
         that way:
 
-          1. Sample the first `_LEADIN_SCAN_WINDOW_SECONDS` of the clip at
-             `_LEADIN_SAMPLE_STEP_SECONDS` intervals.
+          0. FIX #7(a): unconditionally trim a small fixed lead-in margin
+             (`_LEADIN_UNCONDITIONAL_TRIM_SECONDS`) off the front of the
+             clip before anything else runs. Direct native-framerate
+             inspection showed 1-2 frame reference leaks immediately
+             followed by real motion -- too short for the motion-based
+             scan below to ever see as a freeze. This removes that
+             regardless of detection accuracy.
+          1. Sample the first `_LEADIN_SCAN_WINDOW_SECONDS` of the
+             (now pre-trimmed) clip at `_LEADIN_SAMPLE_STEP_SECONDS`
+             intervals.
           2. Diff each consecutive pair of sampled frames against each
              other (NOT against the reference image) via
              `_frame_motion_diff`.
           3. Find the first point where motion is SUSTAINED for
              `_LEADIN_SUSTAINED_MOTION_SAMPLES` consecutive intervals
              (a single moving frame-pair is treated as noise, not motion).
-          4. Trim everything before that point.
-          5. Re-extract the trimmed clip's first two frames and re-check:
+          4. FIX #7(b): if motion is already sustained from the very first
+             sampled interval, don't just trust that -- explicitly check
+             frame 0 against the reference image as a safety net, and trim
+             it out too if it still matches (fast-diverging motion right
+             after a leaked frame was exactly the gap that let leaks
+             through before).
+          5. Otherwise, trim everything before the detected motion point.
+          6. Re-extract the trimmed clip's first two frames and re-check:
              if they're still near-static to each other, OR the first
              frame still matches the reference image (`_frame_matches_reference`,
              used here only as a secondary safety net, not the primary
@@ -1117,25 +1133,66 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         Returns:
             True  -- the clip is CONFIRMED clean: either no lead-in was
                      found (motion was already sustained from the first
-                     sampled frame), a detected lead-in was trimmed and the
-                     re-check found real motion at the new start, or the
-                     whole scan window was ambiguous/ongoing motion that
-                     didn't read as a frozen reference lead-in (left to
-                     `_check_scene_video`'s existing checks).
+                     sampled frame AND frame 0 doesn't match the
+                     reference image), a detected lead-in was trimmed and
+                     the re-check found real motion at the new start, or
+                     the whole scan window was ambiguous/ongoing motion
+                     that didn't read as a frozen reference lead-in (left
+                     to `_check_scene_video`'s existing checks).
             False -- the clip could NOT be confirmed clean and this scene
                      should be treated as a failed attempt (retried/
                      regenerated) rather than shipped. This covers: a scan
                      frame could not be extracted; a detected lead-in
-                     existed but ffmpeg failed to trim it; the entire scan
-                     window was static AND matched the reference image
-                     (lead-in extends past what we can measure); or the
-                     trimmed clip's start is still static/reference-like
-                     after trimming.
+                     (including a frame-0-only leak, FIX #7(b)) existed
+                     but ffmpeg failed to trim it or still matched the
+                     reference after trimming; the entire (2.0s) scan
+                     window was static with no sustained motion found
+                     anywhere in it (FIX #6 -- no longer given the benefit
+                     of the doubt via the unreliable reference-image
+                     match, since that check is known to miss real
+                     lead-in frames); or the trimmed clip's start is still
+                     static/reference-like after trimming.
         """
         ref_paths = self._get_identity_reference_paths()
         if not ref_paths or not os.path.exists(video_path):
             return True
         ref_image_path = ref_paths[0]
+
+        # FIX #7(a): unconditionally trim a small fixed lead-in margin
+        # before any detection runs, so a 1-2 frame reference-conditioning
+        # leak that's immediately followed by real motion (and therefore
+        # invisible to the motion-based scan below) never has a chance to
+        # reach the final video regardless of detection accuracy.
+        pretrim_duration = await self._probe_duration(video_path)
+        if pretrim_duration is not None and pretrim_duration > _LEADIN_UNCONDITIONAL_TRIM_SECONDS + 0.5:
+            base, ext = os.path.splitext(video_path)
+            pretrimmed_path = f"{base}_pretrim{ext or '.mp4'}"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-ss", f"{_LEADIN_UNCONDITIONAL_TRIM_SECONDS:.3f}",
+                    "-i", video_path, pretrimmed_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=60)
+                if proc.returncode == 0 and os.path.exists(pretrimmed_path) and os.path.getsize(pretrimmed_path) > 10_000:
+                    os.replace(pretrimmed_path, video_path)
+                    logger.info(
+                        "[Manuscript] Scene %d: unconditionally trimmed %.2fs fixed "
+                        "lead-in margin before detection", para.index,
+                        _LEADIN_UNCONDITIONAL_TRIM_SECONDS,
+                    )
+                else:
+                    if os.path.exists(pretrimmed_path):
+                        os.remove(pretrimmed_path)
+                    logger.warning(
+                        "[Manuscript] Scene %d: fixed lead-in pre-trim failed "
+                        "(ffmpeg rc=%s), continuing with temporal detection only",
+                        para.index, proc.returncode,
+                    )
+            except Exception:
+                logger.exception("[Manuscript] Scene %d: error during fixed lead-in pre-trim", para.index)
+                if os.path.exists(pretrimmed_path):
+                    os.remove(pretrimmed_path)
 
         sample_times: List[float] = []
         t = 0.0
@@ -1180,41 +1237,104 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 os.remove(p)
 
         if first_motion_index == 0:
-            # Real motion is already present in the very first sampled
-            # interval -- no lead-in to trim.
+            # FIX #7(b): sustained motion is present from the very first
+            # sampled interval of the (now pre-trimmed) clip -- but that
+            # alone doesn't prove frame 0 itself isn't still a
+            # reference-conditioned frame with fast-diverging content
+            # right after it (exactly the failure mode that slipped past
+            # the old logic). Run a direct safety-net check on frame 0.
+            frame0_path = f"{video_path}.motioncheck_f0.jpg"
+            frame0_matches = False
+            if await self._extract_frame_at(video_path, frame0_path, 0.0):
+                frame0_matches = self._frame_matches_reference(frame0_path, ref_image_path)
+                if os.path.exists(frame0_path):
+                    os.remove(frame0_path)
+            if not frame0_matches:
+                logger.info(
+                    "[Manuscript] Scene %d: no lead-in detected (motion present from "
+                    "t=0.00s, frame 0 does not match reference)",
+                    para.index,
+                )
+                return True
+
+            # Frame 0 still reads as the reference/conditioning frame even
+            # though motion follows immediately -- trim that one sampled
+            # interval off (same trim-then-recheck path as a normally
+            # detected lead-in) rather than shipping it.
             logger.info(
-                "[Manuscript] Scene %d: no lead-in detected (motion present from t=0.00s)",
-                para.index,
+                "[Manuscript] Scene %d: frame 0 matches reference despite immediate "
+                "following motion -- trimming %.2fs lead-in frame",
+                para.index, _LEADIN_SAMPLE_STEP_SECONDS,
             )
+            first_motion_index = 0
+            # Fall through to the generic trim-and-recheck path below by
+            # treating the first sample step as the detected lead-in.
+            detected_leadin_seconds = sample_times[0]
+            first_motion_seconds = sample_times[1]
+            base, ext = os.path.splitext(video_path)
+            trimmed_path = f"{base}_noleadin{ext or '.mp4'}"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-ss", f"{first_motion_seconds:.3f}", "-i", video_path,
+                    trimmed_path,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=60)
+                if not (proc.returncode == 0 and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 10_000):
+                    logger.warning(
+                        "[Manuscript] Scene %d: could not strip frame-0 reference "
+                        "leak (ffmpeg failed), cannot confirm clip is clean",
+                        para.index,
+                    )
+                    if os.path.exists(trimmed_path):
+                        os.remove(trimmed_path)
+                    return False
+                os.replace(trimmed_path, video_path)
+                logger.info(
+                    "[Manuscript] Scene %d: stripped frame-0 reference leak from clip",
+                    para.index,
+                )
+            except Exception:
+                logger.exception("[Manuscript] Scene %d: error stripping frame-0 reference leak", para.index)
+                if os.path.exists(trimmed_path):
+                    os.remove(trimmed_path)
+                return False
+
+            recheck_path_0 = f"{video_path}.motionrecheck_f0_00.jpg"
+            if await self._extract_frame_at(video_path, recheck_path_0, 0.0):
+                still_matches = self._frame_matches_reference(recheck_path_0, ref_image_path)
+                if os.path.exists(recheck_path_0):
+                    os.remove(recheck_path_0)
+                if still_matches:
+                    logger.warning(
+                        "[Manuscript] Scene %d: still matches reference after trimming "
+                        "frame-0 leak -- rejecting for regeneration",
+                        para.index,
+                    )
+                    return False
             return True
 
         if first_motion_index is None:
-            # Never found sustained motion inside the scan window. Either
-            # the whole window is a frozen lead-in longer than we scanned
-            # (reference-check will tell us), or this is just very
-            # low-motion real footage -- in which case we must not touch it.
-            first_frame_path = f"{video_path}.motioncheck_start.jpg"
-            still_frozen_and_referencelike = False
-            if await self._extract_frame_at(video_path, first_frame_path, 0.0):
-                still_frozen_and_referencelike = self._frame_matches_reference(first_frame_path, ref_image_path)
-                if os.path.exists(first_frame_path):
-                    os.remove(first_frame_path)
+            # FIX #6: never found sustained motion inside the (now 2.0s)
+            # scan window. Previously this fell back to
+            # `_frame_matches_reference` to decide whether the frozen
+            # window was a lead-in worth rejecting or just calm real
+            # footage safe to leave alone -- but that check is documented
+            # (FIX #5) to reliably MISS real lead-in frames, so it almost
+            # always said "not a match" and the freeze shipped anyway.
+            # With a 2.0s window there is no safe way left to tell "calm
+            # real footage" apart from "unstripped lead-in" -- a real Mia
+            # clip is not expected to hold fully static for 2 full seconds
+            # -- so this is now an unconditional reject: treat it as an
+            # unconfirmed clip and regenerate the scene rather than risk
+            # shipping a frozen/reference-like opening frame.
             logger.warning(
                 "[Manuscript] Scene %d: no sustained motion found within %.2fs scan window "
-                "(detected_leadin_seconds=%.2f, first_motion_seconds=None)",
-                para.index, _LEADIN_SCAN_WINDOW_SECONDS, _LEADIN_SCAN_WINDOW_SECONDS,
+                "-- entire window is static, rejecting scene rather than shipping "
+                "unconfirmed content (regenerating)",
+                para.index, _LEADIN_SCAN_WINDOW_SECONDS,
             )
-            if still_frozen_and_referencelike:
-                logger.warning(
-                    "[Manuscript] Scene %d: entire scan window is static AND matches the "
-                    "reference image -- lead-in likely extends past the scan window, "
-                    "rejecting scene rather than shipping unconfirmed content",
-                    para.index,
-                )
-                return False
-            # Static but not reference-like: treat as real (if very calm)
-            # scene content and leave it alone.
-            return True
+            return False
 
         detected_leadin_seconds = sample_times[first_motion_index]
         first_motion_seconds = sample_times[first_motion_index + 1]
@@ -1380,6 +1500,8 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         self._state.combined_subtitle = srt_path
         self.task_manager.update_state(combined_subtitle=srt_path)
 
+        # Word-level karaoke highlighting data, built from the SAME
+        # word_cues timestamps used for caption timing above.
         word_cues = getattr(sub_maker, "cues", None) if sub_maker else None
         if word_cues:
             try:
@@ -1392,103 +1514,6 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     self.task_manager.update_state(combined_subtitle_words=words_path)
             except Exception:
                 logger.exception("[Manuscript] Karaoke word timing extraction failed")
-
-        # Lip-sync the talking-shot scenes using the SAME word_cues timestamps
-        # captions were just built from (requirement: one timing source for
-        # both). Runs after scene videos + full narration audio both exist.
-        if word_cues and _lipsync_enabled():
-            await self._apply_lipsync_to_talking_scenes(word_cues)
-
-    async def _apply_lipsync_to_talking_scenes(self, word_cues: list) -> None:
-        """Audio-driven lip-sync (Wav2Lip, isolated venv subprocess) applied
-        only to the scenes marked as direct-to-camera talking shots in
-        _generate_scene_prompts (the odd-indexed scenes -- see
-        `is_talking_scene` there). Every other scene stays untouched B-roll.
-
-        Failure handling: if Wav2Lip can't be verified as successful for a
-        given scene (see lipsync.LipSyncFailure), that scene's video is left
-        as-is -- i.e. it keeps whatever native mouth motion the video model
-        produced, WITHOUT being represented as lip-synced anywhere in logs or
-        Discord output. We do not retry into a fake success.
-        """
-        try:
-            from core.pipelines.lipsync import run_lipsync_with_retry
-        except ImportError:
-            logger.warning("[Manuscript] lipsync module not available -- skipping lip-sync stage")
-            return
-
-        paragraphs = self._state.paragraphs
-        combined_audio = self._state.combined_audio
-        if not combined_audio or not os.path.exists(combined_audio):
-            logger.warning("[Manuscript] No combined_audio available -- skipping lip-sync stage")
-            return
-
-        # Map word_cues (flat, whole-script, in order) back to each paragraph
-        # by cumulative word count, so each scene gets exactly the audio span
-        # its own line corresponds to -- the same source of truth captions use.
-        cue_idx = 0
-        total = len(paragraphs)
-        lipsync_count = 0
-        for i, para in enumerate(paragraphs):
-            is_talking_scene = _lipsync_enabled() and ((i % 2 == 1) or (total == 1))
-            n_words = len(para.text.split())
-            para_cues = word_cues[cue_idx: cue_idx + n_words]
-            cue_idx += n_words
-
-            if not is_talking_scene or not para_cues or not para.video_file:
-                continue
-
-            start_sec = para_cues[0].start.total_seconds() if hasattr(para_cues[0].start, "total_seconds") else float(para_cues[0].start)
-            end_sec = para_cues[-1].end.total_seconds() if hasattr(para_cues[-1].end, "total_seconds") else float(para_cues[-1].end)
-            if end_sec <= start_sec:
-                logger.warning("[Manuscript] Scene %d: bad cue span (%.2f-%.2f), skipping lip-sync", i, start_sec, end_sec)
-                continue
-
-            scene_audio_path = os.path.join(self.working_dir, f"scene_{i}_audio.wav")
-            synced_video_path = os.path.join(self.working_dir, f"scene_{i}_lipsynced.mp4")
-
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-i", combined_audio,
-                    "-ss", f"{start_sec:.3f}", "-to", f"{end_sec:.3f}",
-                    "-ar", "16000", "-ac", "1", scene_audio_path,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=30)
-                if proc.returncode != 0 or not os.path.exists(scene_audio_path):
-                    logger.warning("[Manuscript] Scene %d: failed to slice audio span, skipping lip-sync", i)
-                    continue
-            except Exception:
-                logger.exception("[Manuscript] Scene %d: audio slicing errored, skipping lip-sync", i)
-                continue
-
-            await self._emit("lipsync", "running", f"Lip-syncing talking scene {i+1}...", None)
-            result = await run_lipsync_with_retry(
-                face_video_path=os.path.join(self.working_dir, para.video_file) if not os.path.isabs(para.video_file) else para.video_file,
-                audio_path=scene_audio_path,
-                output_path=synced_video_path,
-                retries=1,
-            )
-
-            if result is None:
-                logger.warning(
-                    "[Manuscript] Scene %d: lip-sync could not be verified as successful "
-                    "after retry -- leaving original clip in place (NOT reporting lip-sync "
-                    "for this scene).", i,
-                )
-                continue
-
-            para.video_file = synced_video_path
-            lipsync_count += 1
-            logger.info("[Manuscript] Scene %d: lip-sync verified OK (%.2fs)", i, result.duration_sec)
-
-        logger.info(
-            "[Manuscript] Lip-sync stage complete: %d/%d scenes successfully lip-synced.",
-            lipsync_count, total,
-        )
-        # Surface this honestly in task state so the Discord bot can report
-        # accurate lip-sync coverage instead of implying it always worked.
-        self.task_manager.update_state(lipsync_scenes_synced=lipsync_count, lipsync_scenes_total=total)
 
     async def _conform_scene_to_span(self, para: ManuscriptParagraph, target_duration: float) -> None:
         """FIX #2 (assembly step). The video model only produces clips
