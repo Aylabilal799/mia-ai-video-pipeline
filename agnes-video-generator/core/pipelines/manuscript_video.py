@@ -577,8 +577,28 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             video_path = os.path.join(para_dir, "video.mp4")
 
             if os.path.exists(video_path):
-                para.video_file = video_path
-                continue
+                # A cached clip from a prior run must clear the exact same
+                # bar a freshly generated one does -- existence on disk is
+                # not acceptance. Strip any reference-image lead-in, then
+                # validate. If either fails, discard the stale cache (clip +
+                # task.json) and fall through to normal submit/wait so the
+                # scene gets regenerated below, instead of ever setting
+                # para.video_file on an unverified cached clip.
+                cache_ok = await self._strip_reference_leadin(para, video_path)
+                if cache_ok:
+                    cache_ok, _reason = await self._check_scene_video(video_path, para.scene_prompt)
+                if cache_ok:
+                    para.video_file = video_path
+                    continue
+                logger.warning(
+                    "[Manuscript] Scene %d: cached clip failed lead-in/validation "
+                    "check on resume, discarding cache and regenerating",
+                    para.index,
+                )
+                task_json = os.path.join(para_dir, "task.json")
+                for stale in (task_json, video_path):
+                    if os.path.exists(stale):
+                        os.remove(stale)
 
             if not para.scene_prompt:
                 continue
