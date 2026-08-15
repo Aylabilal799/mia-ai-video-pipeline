@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     youtube_video_id TEXT,
     youtube_url      TEXT,
     privacy_status   TEXT,
-    publish_at       TEXT,
+    publish_at       TEXT,               -- RFC3339 UTC, e.g. 2026-08-20T09:30:00Z
     last_error       TEXT,
     attempts         INTEGER NOT NULL DEFAULT 0,
     created_at       REAL NOT NULL,
@@ -62,25 +62,30 @@ def _conn():
 
 def create_job(job_id: str, video_path: str, seo_path: str, topic: str,
                category: str, script: str, discord_user_id: str,
-               work_dir: str = None, status: str = "generated") -> None:
+               work_dir: str = None, status: str = "generated",
+               publish_at: str = None) -> None:
     """Called once, right after tasks.py finishes moving the final MP4 into
     PUBLIC_SHARE_DIR. video_path MUST be the exact local path the file was
     moved to (tasks.py's `target_video`) -- this store never derives or
-    guesses that path itself."""
+    guesses that path itself.
+
+    publish_at: optional RFC3339 UTC timestamp from !miaschedule. None for
+    !mia / !miascript (immediate publish, no schedule)."""
     now = time.time()
     with _conn() as c:
         c.execute(
             """INSERT INTO jobs
                (job_id, status, video_path, seo_path, work_dir, topic, category,
-                script, discord_user_id, attempts, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                script, discord_user_id, publish_at, attempts, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                ON CONFLICT(job_id) DO UPDATE SET
                    video_path=excluded.video_path,
                    seo_path=excluded.seo_path,
                    work_dir=excluded.work_dir,
+                   publish_at=excluded.publish_at,
                    updated_at=excluded.updated_at""",
             (job_id, status, video_path, seo_path, work_dir, topic, category,
-             script, str(discord_user_id), now, now),
+             script, str(discord_user_id), publish_at, now, now),
         )
 
 

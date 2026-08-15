@@ -72,8 +72,16 @@ def generate_video_task(self, script: str, user_id: str):
 
 
 @app.task(bind=True)
-def generate_mia_video_task(self, topic_or_script: str, category: str, user_id: str, is_raw_script: bool = False):
-    """Celery task executing Mia's mini-vlog generation pipeline."""
+def generate_mia_video_task(self, topic_or_script: str, category: str, user_id: str,
+                             is_raw_script: bool = False, publish_at_iso: str = None):
+    """Celery task executing Mia's mini-vlog generation pipeline.
+
+    publish_at_iso: optional RFC3339 UTC timestamp (e.g. "2026-08-20T09:30:00Z").
+    When set, the video is still uploaded right away but as "private", with
+    YouTube's own publishAt field set -- YouTube itself flips it public at
+    that exact time, no local waiting/cron job needed. Defaults to None, so
+    !mia and !miascript (which don't pass this arg) behave exactly as before.
+    """
     work_dir = os.path.join("/tmp", f"mia_{self.request.id}")
     os.makedirs(work_dir, exist_ok=True)
     try:
@@ -113,9 +121,14 @@ def generate_mia_video_task(self, topic_or_script: str, category: str, user_id: 
             discord_user_id=user_id,
             work_dir=work_dir,
             status="generated",
+            publish_at=publish_at_iso,
         )
         if AUTO_UPLOAD_YOUTUBE:
-            upload_to_youtube_task.delay(self.request.id, privacy_status=YOUTUBE_DEFAULT_PRIVACY)
+            upload_to_youtube_task.delay(
+                self.request.id,
+                privacy_status=("private" if publish_at_iso else YOUTUBE_DEFAULT_PRIVACY),
+                publish_at=publish_at_iso,
+            )
         # --- end YouTube upload stage ----------------------------------------------
 
         return {
@@ -125,6 +138,7 @@ def generate_mia_video_task(self, topic_or_script: str, category: str, user_id: 
             "topic": topic,
             "category": category,
             "script": script,
+            "publish_at": publish_at_iso,
         }
     except Exception as exc:
         logger.exception(f"[Mia Task] Failed: {exc}")

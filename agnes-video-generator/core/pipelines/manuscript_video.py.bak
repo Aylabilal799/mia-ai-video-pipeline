@@ -119,21 +119,6 @@ _REFERENCE_LEAK_HAMMING_THRESHOLD = 3.0
 # how far into a clip (and at what sampling resolution) we scan for that
 # leading run of reference-matching frames before giving up and treating a
 # still-matching window as a genuine generation failure instead.
-#
-# FIX #4b -- lead-in scan MUST be treated as authoritative, not best-effort.
-# The original implementation broke out of the scan loop identically
-# whether a sampled frame (a) did not match the reference (real motion
-# started -- genuinely done) or (b) could not even be extracted (ffmpeg
-# failure / clip not fully flushed yet / bad seek). Both cases fell through
-# to the same "return, nothing more to do" path, which meant a failed
-# extraction at t=0 -- the single hardest, most failure-prone frame to grab,
-# since it's requested immediately after the clip is written to disk --
-# silently looked identical to "no lead-in here, clip is clean". That is
-# how the anchor frame was reaching the final video: stripping silently did
-# nothing and nobody was told. `_strip_reference_leadin` now returns a bool
-# and an extraction failure is NEVER treated as "clip is clean" -- see its
-# docstring and both call sites in `_generate_videos` /
-# `_validate_and_regenerate_scene`.
 _REFERENCE_LEADIN_MAX_SCAN_SECONDS = 1.5
 _REFERENCE_LEADIN_SAMPLE_STEP_SECONDS = 0.15
 
@@ -659,17 +644,8 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     video_output = await self.video_api.wait_for_video(video_id)
                     video_output.save(video_path)
                     # FIX #4: strip any reference-image lead-in frames before
-                    # this clip is used for anything else. A False return
-                    # means we could NOT confirm the clip is clean (either a
-                    # lead-in was found but couldn't be trimmed, or a scan
-                    # frame couldn't even be extracted) -- treat that the
-                    # same as any other generation failure for this attempt
-                    # rather than letting an unconfirmed clip pass through.
-                    if not await self._strip_reference_leadin(para, video_path):
-                        raise RuntimeError(
-                            f"scene {para.index}: could not confirm clip is free of "
-                            f"reference-image lead-in"
-                        )
+                    # this clip is used for anything else.
+                    await self._strip_reference_leadin(para, video_path)
                     break
                 except Exception as e:
                     if retry < _WAIT_RETRIES - 1:
@@ -755,36 +731,13 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 video_output = await self.video_api.wait_for_video(video_id)
                 video_output.save(video_path)
                 # FIX #4: strip any reference-image lead-in frames before
-                # this regenerated clip is re-validated. As above, treat
-                # "could not confirm clean" as a failed regeneration attempt
-                # rather than silently accepting an unconfirmed clip.
-                if not await self._strip_reference_leadin(para, video_path):
-                    logger.warning(
-                        "[Manuscript] Scene %d retry %d: could not confirm clip is free "
-                        "of reference-image lead-in, treating as failed regeneration",
-                        para.index, attempt + 1,
-                    )
-                    continue
+                # this regenerated clip is re-validated.
+                await self._strip_reference_leadin(para, video_path)
                 para.video_id = video_id
                 para.video_file = video_path
                 self.task_manager.update_state(paragraphs=self._state.paragraphs)
             except Exception as e:
                 logger.error(f"[SCENE] Scene {para.index} retry {attempt+1} failed: {e}")
-
-    async def _extract_frame_at(self, video_path: str, output_path: str, timestamp: float) -> bool:
-        """Extracts a single frame from video_path at `timestamp` seconds."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-ss", f"{timestamp:.2f}", "-i", video_path,
-                "-vframes", "1", "-q:v", "2", output_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=15)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
-        except Exception as e:
-            logger.debug(f"[SCENE] frame extraction at {timestamp}s failed: {e}")
-            return False
 
     async def _check_scene_video(self, video_path: str, scene_prompt: str) -> tuple:
         if not os.path.exists(video_path) or os.path.getsize(video_path) < 10_000:
@@ -795,70 +748,37 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             return False, f"suspiciously short video ({duration:.2f}s)"
 
         try:
-            frame_paths = []
-            if duration:
-                timestamps = [max(0.1, duration * f) for f in (0.25, 0.5, 0.75)]
-                for i, ts in enumerate(timestamps):
-                    fp = f"{video_path}.check_frame_{i}.jpg"
-                    if await self._extract_frame_at(video_path, fp, ts):
-                        frame_paths.append(fp)
-
-            # FIX #4b safety net: the 25/50/75% samples above never cover the
-            # very start of the clip, which is exactly where a reference
-            # lead-in lives. _strip_reference_leadin should already have
-            # removed any lead-in before this function ever runs, but this
-            # gives the reference-leak check below a chance to catch it here
-            # too if that ever silently doesn't happen.
-            start_frame_path = f"{video_path}.check_frame_start.jpg"
-            if await self._extract_frame_at(video_path, start_frame_path, 0.1):
-                frame_paths.append(start_frame_path)
-
-            if not frame_paths:
-                fp = video_path + ".check_frame.jpg"
-                if await self._extract_mid_frame(video_path, fp):
-                    frame_paths.append(fp)
-
-            if not frame_paths:
+            frame_path = video_path + ".check_frame.jpg"
+            ok = await self._extract_mid_frame(video_path, frame_path)
+            if not ok:
                 return True, "frame extraction failed, skipping vision check"
 
+            # FIX #3: hard guard -- if the generated scene's frame is
+            # basically a static copy of the canonical reference/anchor
+            # image, this is NOT valid scene content (the reference image
+            # is an identity INPUT only, see `_get_scene_reference_images`)
+            # and must be failed rather than accepted.
             ref_paths = self._get_identity_reference_paths()
-            if ref_paths:
-                for fp in frame_paths:
-                    if self._frame_matches_reference(fp, ref_paths[0]):
-                        for f in frame_paths:
-                            if os.path.exists(f):
-                                os.remove(f)
-                        return False, "generated frame matches the reference/anchor image -- not real scene content"
+            if ref_paths and self._frame_matches_reference(frame_path, ref_paths[0]):
+                if os.path.exists(frame_path):
+                    os.remove(frame_path)
+                return False, "generated frame matches the reference/anchor image -- not real scene content"
 
             system_prompt = (
                 "You are a QA reviewer for AI-generated video scenes featuring a fixed human character."
             )
             user_prompt = (
-                "This is one frame sampled from a video scene. The scene overall was "
-                "supposed to show: \"" + (scene_prompt or "") + "\"\n\n"
-                "This single frame will only ever show ONE moment of that action, not "
-                "all of it -- that is expected and fine.\n\n"
-                "Answer with exactly one word, YES or NO: is a woman clearly present "
-                "and recognizable as the main subject of this frame, in a setting/pose "
-                "broadly consistent with the scene (not an empty shot, not someone "
-                "else, not an unrelated scene)?"
+                "This is a frame from a video scene. The scene was supposed to show: \"" + (scene_prompt or "") + "\"\n\n"
+                "Answer with exactly one word, YES or NO: does this image clearly show a woman as the main subject, "
+                "actually performing/matching the described scene?"
             )
-
-            passed = False
-            for fp in frame_paths:
-                answer = await asyncio.to_thread(
-                    self.screenwriter._chat_multimodal, system_prompt, user_prompt, [fp],
-                )
-                normalized = (answer or "").strip().upper()
-                if not normalized.startswith("NO"):
-                    passed = True
-                    break
-
-            for fp in frame_paths:
-                if os.path.exists(fp):
-                    os.remove(fp)
-
-            if not passed:
+            answer = await asyncio.to_thread(
+                self.screenwriter._chat_multimodal, system_prompt, user_prompt, [frame_path],
+            )
+            if os.path.exists(frame_path):
+                os.remove(frame_path)
+            normalized = (answer or "").strip().upper()
+            if normalized.startswith("NO"):
                 return False, "vision check: main subject not clearly visible / scene mismatch"
             return True, "ok"
         except Exception as e:
@@ -932,7 +852,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         except Exception:
             return False
 
-    async def _strip_reference_leadin(self, para: ManuscriptParagraph, video_path: str) -> bool:
+    async def _strip_reference_leadin(self, para: ManuscriptParagraph, video_path: str) -> None:
         """FIX #4. Agnes's image-to-video mode anchors a freshly generated
         clip's first frame(s) to the exact conditioning/reference image
         before real motion starts -- confirmed by hash-scanning an actual
@@ -951,41 +871,18 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         motion was ever produced), not a trimmable lead-in, and is left to
         the existing reference-match guard in `_check_scene_video` to fail
         the scene properly rather than being silently deleted here.
-
-        Returns:
-            True  -- the clip is CONFIRMED clean: either no lead-in was
-                     found (scan sampled real, non-reference frames), the
-                     entire scan window still matched (handed off to
-                     `_check_scene_video` to fail properly), or a detected
-                     lead-in was successfully trimmed.
-            False -- the clip could NOT be confirmed clean. Either a
-                     detected lead-in existed but ffmpeg failed to trim it,
-                     OR -- critically -- a scan frame could not even be
-                     extracted (e.g. the clip wasn't fully flushed yet, a
-                     bad seek, a transient ffmpeg error). A failed
-                     extraction is NEVER treated as "no lead-in here": that
-                     conflation is what previously let reference frames
-                     reach the final video silently. Callers must fail this
-                     scene (retry or drop it) rather than proceed, per the
-                     requirement to never insert the anchor image into
-                     scene output.
         """
         ref_paths = self._get_identity_reference_paths()
         if not ref_paths or not os.path.exists(video_path):
-            return True
+            return
         ref_image_path = ref_paths[0]
 
         cutoff = 0.0
         matched_any = False
-        extraction_failed = False
         t = 0.0
         while t <= _REFERENCE_LEADIN_MAX_SCAN_SECONDS:
             frame_path = f"{video_path}.leadin_{t:.2f}.jpg"
             if not await self._extract_frame_at(video_path, frame_path, t):
-                # NOT the same as "real motion started". We genuinely don't
-                # know whether this frame would have matched the reference
-                # or not, so we cannot certify the clip as clean.
-                extraction_failed = True
                 break
             is_match = self._frame_matches_reference(frame_path, ref_image_path)
             if os.path.exists(frame_path):
@@ -998,19 +895,10 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         else:
             # Every sampled frame in the scan window matched the reference --
             # leave the clip untouched; _check_scene_video will fail it.
-            return True
-
-        if extraction_failed:
-            logger.warning(
-                "[Manuscript] Scene %d: could not extract frame(s) while scanning for "
-                "reference lead-in at %.2fs -- cannot confirm clip is free of the anchor "
-                "image, failing this attempt rather than risk shipping it",
-                para.index, t,
-            )
-            return False
+            return
 
         if not matched_any or cutoff <= 0.0:
-            return True
+            return
 
         base, ext = os.path.splitext(video_path)
         trimmed_path = f"{base}_noleadin{ext or '.mp4'}"
@@ -1027,16 +915,14 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                     "[Manuscript] Scene %d: stripped %.2fs of reference-image lead-in from clip",
                     para.index, cutoff,
                 )
-                return True
-            logger.warning(
-                "[Manuscript] Scene %d: could not strip reference lead-in (ffmpeg failed), "
-                "cannot confirm clip is clean",
-                para.index,
-            )
-            return False
+            else:
+                logger.warning(
+                    "[Manuscript] Scene %d: could not strip reference lead-in (ffmpeg failed), "
+                    "keeping original clip -- downstream validation may catch this",
+                    para.index,
+                )
         except Exception:
             logger.exception("[Manuscript] Scene %d: error stripping reference lead-in", para.index)
-            return False
 
     @staticmethod
     async def _probe_duration(video_path: str) -> Optional[float]:

@@ -3,12 +3,15 @@
 import os
 import asyncio
 import logging
+
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
+
 from tasks import generate_mia_video_task, generate_video_task
 from celery.result import AsyncResult
 import mia_config as mia_cfg
+from schedule_utils import parse_schedule_datetime, ScheduleParseError, SCHEDULE_TIMEZONE
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -44,10 +47,8 @@ async def video_command(ctx, *, script: str):
         return
 
     status_msg = await ctx.send("🎬 Video generation started! This may take a few minutes. I'll notify you when it's ready.")
-
     task = generate_video_task.delay(script, ctx.author.id)
     user_tasks[ctx.author.id] = task.id
-
     await check_task_and_respond(ctx, task.id, status_msg)
 
 
@@ -62,7 +63,6 @@ async def check_task_and_respond(ctx, task_id, status_msg):
         if state == 'PENDING':
             await asyncio.sleep(5)
             continue
-
         elif state == 'PROGRESS':
             info = result.info if isinstance(result.info, dict) else {}
             stage = info.get('stage')
@@ -78,7 +78,6 @@ async def check_task_and_respond(ctx, task_id, status_msg):
                     pass
             await asyncio.sleep(5)
             continue
-
         elif state == 'SUCCESS':
             video_url = result.result
             if video_url:
@@ -86,13 +85,11 @@ async def check_task_and_respond(ctx, task_id, status_msg):
             else:
                 await ctx.send("❌ Video generation finished but no download link was returned.")
             break
-
         elif state == 'FAILURE':
             info = result.info
             error = info.get('error', str(info)) if isinstance(info, dict) else str(info)
             await ctx.send(f"❌ Video generation failed: {error}")
             break
-
         else:
             await ctx.send(f"❓ Unknown state: {state}")
             break
@@ -114,16 +111,13 @@ def _parse_mia_args(raw: str):
 async def mia_command(ctx, *, args: str = ""):
     """Generate a Mia mini-vlog video."""
     category, topic = _parse_mia_args(args)
-
     status_msg = await ctx.send(
         f"💃 Mia mini-vlog started (category: {category or 'auto'})! "
         "Writing script, generating vlog scenes with karaoke captions, "
         "and extracting video thumbnail..."
     )
-
     task = generate_mia_video_task.delay(topic, category, ctx.author.id, False)
     user_tasks[ctx.author.id] = task.id
-
     await check_mia_task_and_respond(ctx, task.id, status_msg)
 
 
@@ -149,10 +143,45 @@ async def mia_script_command(ctx, *, script: str):
             return
 
     status_msg = await ctx.send("💃 Mia mini-vlog started from custom script! Generating video...")
-
     task = generate_mia_video_task.delay(script, None, ctx.author.id, True)
     user_tasks[ctx.author.id] = task.id
+    await check_mia_task_and_respond(ctx, task.id, status_msg)
 
+
+@bot.command(name='miaschedule')
+async def mia_schedule_command(ctx, date: str, time: str, *, script: str):
+    """Generate a Mia mini-vlog from a verbatim script and schedule its
+    YouTube publish time.
+
+    Usage: !miaschedule 2026-08-20 14:30 <script text>
+    Date/time are interpreted in the SCHEDULE_TIMEZONE configured in .env.
+    """
+    if len(script) < 10:
+        await ctx.send("❌ Script too short. Please provide at least 10 characters.")
+        return
+
+    try:
+        publish_at_iso = parse_schedule_datetime(date, time)
+    except ScheduleParseError as e:
+        await ctx.send(f"❌ {e}")
+        return
+
+    existing_task_id = user_tasks.get(ctx.author.id)
+    if existing_task_id:
+        existing_state = AsyncResult(existing_task_id).state
+        if existing_state in ('PENDING', 'PROGRESS', 'STARTED'):
+            await ctx.send(
+                "⏳ You already have a Mia video generating. Please wait for it "
+                "to finish before starting another."
+            )
+            return
+
+    status_msg = await ctx.send(
+        f"💃 Mia mini-vlog started! It'll upload as **private** now, then "
+        f"YouTube will auto-publish it at **{date} {time} ({SCHEDULE_TIMEZONE})**..."
+    )
+    task = generate_mia_video_task.delay(script, None, ctx.author.id, True, publish_at_iso)
+    user_tasks[ctx.author.id] = task.id
     await check_mia_task_and_respond(ctx, task.id, status_msg)
 
 
@@ -166,7 +195,6 @@ async def check_mia_task_and_respond(ctx, task_id, status_msg):
         if state == 'PENDING':
             await asyncio.sleep(5)
             continue
-
         elif state == 'PROGRESS':
             info = result.info if isinstance(result.info, dict) else {}
             stage = info.get('stage')
@@ -182,7 +210,6 @@ async def check_mia_task_and_respond(ctx, task_id, status_msg):
                     pass
             await asyncio.sleep(5)
             continue
-
         elif state == 'SUCCESS':
             data = result.result if isinstance(result.result, dict) else {}
             video_url = data.get('video_url')
@@ -190,6 +217,7 @@ async def check_mia_task_and_respond(ctx, task_id, status_msg):
             seo_url = data.get('seo_url')
             topic = data.get('topic', '')
             category = data.get('category', '')
+            publish_at = data.get('publish_at')
 
             if video_url:
                 msg = (
@@ -199,7 +227,8 @@ async def check_mia_task_and_respond(ctx, task_id, status_msg):
                 )
                 if seo_url:
                     msg += f"\n📄 **YouTube SEO Package:** {seo_url}"
-
+                if publish_at:
+                    msg += f"\n⏰ **Scheduled YouTube publish:** {publish_at} (UTC)"
                 if thumbnail_url:
                     embed = discord.Embed(
                         title=f"🎬 Mia Mini-Vlog: {topic[:50]}",
@@ -213,13 +242,11 @@ async def check_mia_task_and_respond(ctx, task_id, status_msg):
             else:
                 await ctx.send("❌ Video generation finished but no download link was returned.")
             break
-
         elif state == 'FAILURE':
             info = result.info
             error = info.get('error', str(info)) if isinstance(info, dict) else str(info)
             await ctx.send(f"❌ Mia mini-vlog generation failed: {error}")
             break
-
         else:
             await ctx.send(f"❓ Unknown state: {state}")
             break
