@@ -678,6 +678,12 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 try:
                     video_output = await self.video_api.wait_for_video(video_id)
                     video_output.save(video_path)
+                    # DIAG (temporary, no behavior change): fingerprint the
+                    # raw clip BEFORE strip runs, so we can tell on the next
+                    # run whether the leak is present in the source clip at
+                    # all, and whether the pre-strip scan's own frame grabs
+                    # are themselves suspect (corrupt/truncated) at t=0.
+                    await self._diag_log_leadin_state(para, video_path, "PRE-STRIP")
                     # FIX #4: strip any reference-image lead-in frames before
                     # this clip is used for anything else. A False return
                     # means we could NOT confirm the clip is clean (either a
@@ -690,6 +696,11 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                             f"scene {para.index}: could not confirm clip is free of "
                             f"reference-image lead-in"
                         )
+                    # DIAG (temporary, no behavior change): fingerprint the
+                    # SAME video_path AGAIN immediately after strip claims
+                    # success, so we can see directly whether the file on
+                    # disk at this exact path is actually clean at t=0.
+                    await self._diag_log_leadin_state(para, video_path, "POST-STRIP")
                     break
                 except Exception as e:
                     if retry < _WAIT_RETRIES - 1:
@@ -774,6 +785,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 self._save_task_json(para_dir, {"video_id": video_id})
                 video_output = await self.video_api.wait_for_video(video_id)
                 video_output.save(video_path)
+                await self._diag_log_leadin_state(para, video_path, "PRE-STRIP-RETRY")
                 # FIX #4: strip any reference-image lead-in frames before
                 # this regenerated clip is re-validated. As above, treat
                 # "could not confirm clean" as a failed regeneration attempt
@@ -785,6 +797,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                         para.index, attempt + 1,
                     )
                     continue
+                await self._diag_log_leadin_state(para, video_path, "POST-STRIP-RETRY")
                 para.video_id = video_id
                 para.video_file = video_path
                 self.task_manager.update_state(paragraphs=self._state.paragraphs)
@@ -792,16 +805,34 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 logger.error(f"[SCENE] Scene {para.index} retry {attempt+1} failed: {e}")
 
     async def _extract_frame_at(self, video_path: str, output_path: str, timestamp: float) -> bool:
-        """Extracts a single frame from video_path at `timestamp` seconds."""
+        """Extracts a single frame from video_path at `timestamp` seconds.
+
+        Returns True only when ffmpeg exits cleanly (returncode == 0), the
+        output JPG exists, and it's larger than 1000 bytes. Any invalid or
+        truncated extracted frame is deleted and this returns False.
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-ss", f"{timestamp:.2f}", "-i", video_path,
-                "-vframes", "1", "-q:v", "2", output_path,
+                "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", video_path,
+                "-frames:v", "1", "-q:v", "2", output_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=15)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+
+            valid = (
+                proc.returncode == 0
+                and os.path.exists(output_path)
+                and os.path.getsize(output_path) > 1000
+            )
+            if not valid:
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                return False
+            return True
         except Exception as e:
             logger.debug(f"[SCENE] frame extraction at {timestamp}s failed: {e}")
             return False
@@ -937,20 +968,66 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         except Exception:
             return False
 
-    @staticmethod
-    async def _extract_frame_at(video_path: str, frame_path: str, timestamp: float) -> bool:
+    async def _diag_log_leadin_state(self, para: ManuscriptParagraph, video_path: str, tag: str) -> None:
+        """DIAGNOSTIC ONLY -- no effect on pipeline behavior or output.
+
+        Logs, for `video_path` at this exact moment: real path, mtime,
+        size, and whether a freshly-extracted frame at t=0.00 / t=0.15 /
+        t=0.30 (a) could even be extracted at all and (b) hashes as a
+        match against the canonical reference image. This exists purely
+        to confirm or rule out, on the next real run, whether frame
+        extraction immediately after a clip is written to disk is
+        returning corrupt/truncated frames that read as "not a match"
+        (and therefore short-circuit `_strip_reference_leadin`'s scan)
+        even though the file is not actually clean yet.
+
+        Never raises -- any failure here is swallowed and logged, since
+        this must not be able to affect the real pipeline run.
+        """
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", video_path,
-                "-frames:v", "1",
-                frame_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+            ref_paths = self._get_identity_reference_paths()
+            if not ref_paths or not os.path.exists(video_path):
+                return
+            ref_image_path = ref_paths[0]
+            real_path = os.path.realpath(video_path)
+            try:
+                stat = os.stat(video_path)
+                size_bytes, mtime = stat.st_size, stat.st_mtime
+            except OSError:
+                size_bytes, mtime = -1, -1.0
+
+            samples = []
+            for t in (0.0, 0.15, 0.30):
+                probe_path = f"{video_path}.diag_{tag}_{t:.2f}.jpg"
+                extracted = await self._extract_frame_at(video_path, probe_path, t)
+                if not extracted:
+                    samples.append((t, "EXTRACT_FAILED", None))
+                    continue
+                probe_size = os.path.getsize(probe_path) if os.path.exists(probe_path) else -1
+                is_match = self._frame_matches_reference(probe_path, ref_image_path)
+                hamming = None
+                try:
+                    from PIL import Image
+                    def _ahash(p):
+                        img = Image.open(p).convert("L").resize((16, 16))
+                        px = list(img.getdata())
+                        avg = sum(px) / len(px)
+                        return [1 if v > avg else 0 for v in px]
+                    h1, h2 = _ahash(probe_path), _ahash(ref_image_path)
+                    hamming = sum(a != b for a, b in zip(h1, h2))
+                except Exception:
+                    pass
+                samples.append((t, f"jpg_bytes={probe_size} match={is_match} hamming={hamming}", None))
+                if os.path.exists(probe_path):
+                    os.remove(probe_path)
+
+            logger.warning(
+                "[DIAG][%s] Scene %d: path=%s realpath=%s size=%d mtime=%.3f | %s",
+                tag, para.index, video_path, real_path, size_bytes, mtime,
+                " | ".join(f"t={t:.2f}s -> {info}" for t, info, _ in samples),
             )
-            await asyncio.wait_for(proc.communicate(), timeout=20)
-            return proc.returncode == 0 and os.path.exists(frame_path)
         except Exception:
-            return False
+            logger.exception("[DIAG][%s] Scene %d: diagnostic logging itself failed", tag, para.index)
 
     async def _strip_reference_leadin(self, para: ManuscriptParagraph, video_path: str) -> bool:
         """FIX #4. Agnes's image-to-video mode anchors a freshly generated
@@ -1347,6 +1424,14 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
             span = self._scene_time_spans.get(para.index)
             if span:
                 await self._conform_scene_to_span(para, span[1] - span[0])
+
+        # DIAG (temporary, no behavior change): fingerprint the EXACT file
+        # each paragraph is about to hand to the concatenator, at the exact
+        # path used, immediately before concatenation. Answers directly:
+        # "is the cleaned file the one actually passed to concat?"
+        for para in paragraphs:
+            if para.video_file and os.path.exists(para.video_file):
+                await self._diag_log_leadin_state(para, para.video_file, "PRE-CONCAT")
 
         video_paths = [p.video_file for p in paragraphs if p.video_file and os.path.exists(p.video_file)]
         if not video_paths:
